@@ -1,0 +1,9 @@
+spotipy
+python-dotenv
+click
+pydantic
+pydantic-settings
+aiohttp
+rich
+discogs-client
+Pillow

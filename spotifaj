@@ -1,0 +1,20 @@
+#!/bin/bash
+# Wrapper script to run spotifaj.py in a self-contained virtual environment.
+
+# Get the directory where this script is located
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$DIR/.venv"
+
+# Check if virtual environment exists
+if [ ! -d "$VENV" ]; then
+    echo "Initializing virtual environment in $VENV..." >&2
+    python3 -m venv "$VENV"
+    
+    echo "Installing dependencies..." >&2
+    "$VENV/bin/pip" install --upgrade pip >&2
+    "$VENV/bin/pip" install -r "$DIR/requirements.txt" >&2
+    echo "Setup complete." >&2
+fi
+
+# Run the python script using the virtual environment
+exec "$VENV/bin/python" "$DIR/spotifaj.py" "$@"
