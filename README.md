@@ -26,7 +26,7 @@ A powerful, feature-rich command-line interface for managing Spotify playlists, 
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/yourusername/spotifaj.git
+    git clone https://gitlab.com/oivan/spotifaj.git
     cd spotifaj
     ```
 

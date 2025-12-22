@@ -297,18 +297,104 @@ def get_track_info(item, album_data=None):
 
     return track_info
 
-def search(sp, query, limit=50, offset=0):
-    """Searches given users input and returns results."""
+def search(sp, query, limit=50, offset=0, fetch_all=False):
+    """Searches given users input and returns results.
+    
+    Args:
+        sp: Spotify client
+        query: Search query
+        limit: Max number of results to return.
+        offset: Starting offset
+        fetch_all: If True, attempts to fetch ALL results, bypassing 1000 limit if needed.
+    """
     all_results = {}
+    tracks = []
     
     try:
-        track_results = sp.search(query, limit=limit, offset=offset, market=COUNTRY, type='track')
-        all_results['tracks'] = track_results['tracks']['items']
+        # Initial search to get total
+        first_limit = 50 if (fetch_all or limit is None) else min(limit, 50)
+        results = sp.search(query, limit=first_limit, offset=offset, market=COUNTRY, type='track')
+        items = results['tracks']['items']
+        total = results['tracks']['total']
+        tracks.extend(items)
         
+        target_limit = limit if limit is not None else 50
+        if fetch_all:
+            target_limit = total
+            
+        # If we need more results
+        if total > len(tracks) and (fetch_all or len(tracks) < target_limit):
+            
+            # STRATEGY 1: Year-based exhaustive search (if > 1000 results and fetch_all is True)
+            if fetch_all and total >= 1000:
+                logger.info(f"Query matches {total} tracks. Using year-based search to bypass 1000 limit...")
+                # Reset tracks to ensure clean exhaustive list
+                tracks = [] 
+                seen_ids = set()
+                
+                current_year = datetime.datetime.now().year
+                start_year = 1950 
+                
+                # Use a progress indicator if possible, or just log
+                for year in range(start_year, current_year + 2):
+                    year_query = f"{query} year:{year}"
+                    year_offset = 0
+                    
+                    while True:
+                        try:
+                            yr = sp.search(year_query, limit=50, offset=year_offset, market=COUNTRY, type='track')
+                            y_items = yr['tracks']['items']
+                            if not y_items:
+                                break
+                            
+                            for item in y_items:
+                                if item['id'] not in seen_ids:
+                                    seen_ids.add(item['id'])
+                                    tracks.append(item)
+                            
+                            if yr['tracks']['next']:
+                                year_offset += 50
+                                # Safety break for year-specific 1000 limit (unlikely to hit for one year)
+                                if year_offset >= 1000: 
+                                    break
+                            else:
+                                break
+                        except Exception as e:
+                            # Rate limit or other error
+                            logger.warning(f"Error searching year {year}: {e}")
+                            break
+            
+            # STRATEGY 2: Standard Pagination (if < 1000 results or fetch_all=False)
+            else:
+                current_offset = offset + len(items)
+                
+                while len(tracks) < target_limit:
+                    remaining = target_limit - len(tracks)
+                    fetch_size = min(50, remaining)
+                    
+                    # Check 1000 limit
+                    if current_offset + fetch_size > 1000:
+                        fetch_size = 1000 - current_offset
+                        if fetch_size <= 0:
+                            if fetch_all:
+                                logger.warning("Reached Spotify's 1000 item limit. Use year-specific queries to get more.")
+                            break
+                    
+                    res = sp.search(query, limit=fetch_size, offset=current_offset, market=COUNTRY, type='track')
+                    new_items = res['tracks']['items']
+                    if not new_items:
+                        break
+                        
+                    tracks.extend(new_items)
+                    current_offset += len(new_items)
+                    
+                    if res['tracks']['total'] <= current_offset:
+                        break
+                        
     except Exception as e:
         logger.error(f"Search error: {e}")
-        all_results['tracks'] = []
-
+        
+    all_results['tracks'] = tracks
     return all_results
 
 def search_tracks_by_year(sp, label, year, market='US'):
