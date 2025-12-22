@@ -8,7 +8,9 @@ import sys
 import os
 import re
 import time
+from difflib import SequenceMatcher
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table, Column
 from rich.progress import (
     Progress,
@@ -324,26 +326,90 @@ def search(query, type):
         
     logger.info(f"Searching for: '{query}' (Type: {type})...")
     try:
-        results = sp.search(q=query, type=type, limit=20)
+        # Fetch more results to account for duplicates
+        results = sp.search(q=query, type=type, limit=50)
         items = results[f'{type}s']['items']
         if not items:
             logger.info("No results found.")
             return
             
-        for i, item in enumerate(items):
+        # Sort by similarity to query, then popularity
+        if type in ['track', 'artist', 'album']:
+             def sort_key(item):
+                 name = item['name']
+                 # Calculate similarity
+                 similarity = SequenceMatcher(None, query.lower().strip(), name.lower().strip()).ratio()
+                 # Return tuple: (similarity, popularity)
+                 # This ensures exact/close matches come first, and among those, the most popular ones.
+                 return (similarity, item.get('popularity', 0))
+             
+             items.sort(key=sort_key, reverse=True)
+
+        # If artist search, prioritize exact matches and reduce noise
+        if type == 'artist':
+            exact_matches = [item for item in items if item['name'].lower().strip() == query.lower().strip()]
+            if exact_matches:
+                items = exact_matches
+            else:
+                # If no exact match, limit to top 5 to avoid long list of bad matches
+                items = items[:5]
+
+        seen = set()
+        unique_items = []
+        
+        for item in items:
             name = item['name']
+            # Create a unique key for deduplication based on display attributes
+            if type == 'track':
+                # Use primary artist only for deduplication
+                primary_artist = item['artists'][0]['name']
+                # Normalize name: remove (...) and [...] and - ...
+                norm_name = re.sub(r"(?i)\s*(\(|\[|-).*", "", name)
+                key = f"{norm_name}:{primary_artist}"
+            elif type == 'artist':
+                key = name
+            elif type == 'album':
+                primary_artist = item['artists'][0]['name']
+                norm_name = re.sub(r"(?i)\s*(\(|\[|-).*", "", name)
+                key = f"{norm_name}:{primary_artist}"
+            elif type == 'playlist':
+                owner = item['owner']['display_name']
+                key = f"{name}:{owner}"
+            else:
+                key = item['id']
+            
+            # Normalize key for case-insensitive comparison
+            key = key.lower().strip()
+            
+            if key not in seen:
+                seen.add(key)
+                unique_items.append(item)
+            
+            if len(unique_items) >= 20:
+                break
+
+        for i, item in enumerate(unique_items):
+            name = item['name']
+            # Use Spotify URI (spotify:...) to open directly in app
+            url = item.get('uri') or item.get('external_urls', {}).get('spotify', '')
+            
+            def fmt_link(text, target):
+                return f"[link={target}]{escape(text)}[/link]" if target else escape(text)
+
+            prefix = f"{i+1:>2}. " if len(unique_items) > 1 else ""
+
             # Handle different item types for display
             if type == 'track':
                 artists = ", ".join([a['name'] for a in item['artists']])
-                print(f"{i+1}. {name} - {artists}")
+                console.print(f"{prefix}{fmt_link(f'{name} - {artists}', url)}", highlight=False)
             elif type == 'artist':
-                print(f"{i+1}. {name}")
+                console.print(f"{prefix}{fmt_link(name, url)}", highlight=False)
             elif type == 'album':
                 artists = ", ".join([a['name'] for a in item['artists']])
-                print(f"{i+1}. {name} - {artists}")
+                console.print(f"{prefix}{fmt_link(f'{name} - {artists}', url)}", highlight=False)
             elif type == 'playlist':
                 owner = item['owner']['display_name']
-                print(f"{i+1}. {name} (by {owner})")
+                console.print(f"{prefix}{fmt_link(f'{name} (by {owner})', url)}", highlight=False)
                 
     except Exception as e:
         logger.error(f"Error during search: {e}")
@@ -374,7 +440,12 @@ def list_playlists(username):
 @click.argument('query')
 @click.option('--username', default=settings.spotipy_username, help="Spotify username.")
 @click.option('--playlist', help="Name of the playlist to create.")
-def search_and_add(query, username, playlist):
+@click.option('--artist', is_flag=True, help="Filter results by artist.")
+@click.option('--album', is_flag=True, help="Filter results by album.")
+@click.option('--track', is_flag=True, help="Filter results by track.")
+@click.option('--limit', default=50, help="Number of tracks to fetch (default 50).")
+@click.option('--all', 'fetch_all', is_flag=True, help="Fetch all results (up to 1000).")
+def search_and_add(query, username, playlist, artist, album, track, limit, fetch_all):
     """Search for tracks by query and add to a new playlist."""
     playlist_name = playlist if playlist else f"Search: {query}"
     
@@ -383,10 +454,73 @@ def search_and_add(query, username, playlist):
         logger.error("Failed to initialize Spotify client.")
         sys.exit(1)
         
-    logger.info(f"Searching for: '{query}'...")
+    search_query = query
+    if artist:
+        search_query = f"artist:{query}"
+    elif album:
+        search_query = f"album:{query}"
+    elif track:
+        search_query = f"track:{query}"
+    else:
+        # Attempt to detect intent
+        logger.info("Detecting search intent...")
+        try:
+            # Search for single result in each category
+            intent_results = sp.search(q=query, type='artist,album,track', limit=1)
+            
+            best_type = 'track'
+            best_score = 0.0
+            best_match_name = query
+            
+            # Check Artist
+            if intent_results.get('artists', {}).get('items'):
+                artist_obj = intent_results['artists']['items'][0]
+                score = SequenceMatcher(None, query.lower(), artist_obj['name'].lower()).ratio()
+                # Boost artist score slightly as it's a common intent for "Name" queries
+                if score > 0.8: 
+                    best_score = score
+                    best_type = 'artist'
+                    best_match_name = artist_obj['name']
+            
+            # Check Album (only override artist if significantly better)
+            if intent_results.get('albums', {}).get('items'):
+                album_obj = intent_results['albums']['items'][0]
+                score = SequenceMatcher(None, query.lower(), album_obj['name'].lower()).ratio()
+                if score > best_score and score > 0.9:
+                    best_score = score
+                    best_type = 'album'
+                    best_match_name = album_obj['name']
+            
+            # Check Track (only override if exact match or very high confidence and others are low)
+            if intent_results.get('tracks', {}).get('items'):
+                track_obj = intent_results['tracks']['items'][0]
+                score = SequenceMatcher(None, query.lower(), track_obj['name'].lower()).ratio()
+                # If track is exact match, it might be a track search, but "Thriller" is both.
+                # Usually if user wants a playlist, Artist or Album is better source than single track.
+                # So we only default to track if Artist/Album scores are low.
+                pass 
+
+            if best_type == 'artist' and best_score > 0.8:
+                logger.info(f"Detected Artist intent: '{best_match_name}' (Confidence: {best_score:.2f})")
+                # Use original query to avoid incorrect auto-correction (e.g. Igor Jadranin -> Igor Garanin)
+                search_query = f"artist:{query}"
+            elif best_type == 'album' and best_score > 0.9:
+                logger.info(f"Detected Album intent: '{best_match_name}' (Confidence: {best_score:.2f})")
+                search_query = f"album:{query}"
+            else:
+                logger.info(f"Using general search (Best guess: {best_type}, Score: {best_score:.2f})")
+                
+        except Exception as e:
+            logger.warning(f"Intent detection failed: {e}")
+
+    search_limit = limit
+    if fetch_all:
+        search_limit = None # Let search function handle it
+        
+    logger.info(f"Searching for: '{search_query}'...")
     
     # Using spotifaj_functions.search which returns a dict with 'tracks'
-    results = spotifaj_functions.search(sp, query)
+    results = spotifaj_functions.search(sp, search_query, limit=search_limit, fetch_all=fetch_all)
     tracks = results.get('tracks', [])
     total_tracks = len(tracks)
     
@@ -395,9 +529,30 @@ def search_and_add(query, username, playlist):
     if total_tracks == 0:
         return
 
+    # Display tracks (limit to 20 by default unless user asked for more via limit option explicitly?)
+    # User requirement: "per default if no option provided - display only first 20"
+    display_limit = 20
+    
+    for i, track in enumerate(tracks):
+        if i >= display_limit:
+            break
+            
+        name = track['name']
+        artists = ", ".join([a['name'] for a in track['artists']])
+        # Use Spotify URI (spotify:...) to open directly in app
+        url = track.get('uri') or track.get('external_urls', {}).get('spotify', '')
+        
+        def fmt_link(text, target):
+            return f"[link={target}]{escape(text)}[/link]" if target else escape(text)
+            
+        console.print(f"{i+1:>2}. {fmt_link(f'{name} - {artists}', url)}", highlight=False)
+
+    if total_tracks > display_limit:
+        console.print(f"... and {total_tracks - display_limit} more tracks (not displayed).")
+
     track_ids = [t['id'] for t in tracks]
 
-    if spotifaj_functions.confirm(f"Create playlist '{playlist_name}' and add {total_tracks} tracks?"):
+    if spotifaj_functions.confirm(f"Create playlist '{playlist_name}' and add ALL {total_tracks} tracks?"):
         logger.info(f"Creating playlist '{playlist_name}' for user '{username}'...")
         playlist_id = spotifaj_functions.create_playlist(username, playlist_name)
         
