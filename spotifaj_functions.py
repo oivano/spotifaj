@@ -36,6 +36,33 @@ DEFAULT_SCOPE = (
 
 COUNTRY = 'US'
 
+
+def _spotify_call(fn, retries=3, backoff=1.5):
+    """Call a Spotify API function with simple retry/backoff for 429/5xx."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except spotipy.exceptions.SpotifyException as e:
+            status = getattr(e, 'http_status', None)
+            retry_after = None
+            if hasattr(e, 'headers'):
+                retry_after = e.headers.get('Retry-After')
+            if status == 429 and attempt < retries - 1:
+                sleep_for = int(retry_after) if retry_after else backoff ** attempt
+                time.sleep(sleep_for)
+                continue
+            if status and 500 <= status < 600 and attempt < retries - 1:
+                time.sleep(backoff ** attempt)
+                continue
+            logger.error(f"Spotify API error (status {status}): {e}")
+            return None
+        except Exception as e:  # pragma: no cover - unexpected runtime errors
+            if attempt < retries - 1:
+                time.sleep(backoff ** attempt)
+                continue
+            logger.error(f"Unexpected Spotify call error: {e}")
+            return None
+
 def get_spotify_client(username=None, scope=DEFAULT_SCOPE):
     """
     Returns an authenticated spotipy.Spotify client.
@@ -99,7 +126,7 @@ def create_playlist(username, playlist_name, public=False):
     sp = get_spotify_client(username=username)
     if sp:
         try:
-            playlist = sp.user_playlist_create(username, playlist_name, public=public)
+            playlist = _spotify_call(lambda: sp.user_playlist_create(username, playlist_name, public=public))
             return playlist['id']
         except Exception as e:
             logger.error(f"Error creating playlist: {e}")
@@ -110,13 +137,13 @@ def change_playlist_name(username, playlist_id, new_name):
     """Changes a playlist's name."""
     sp = get_spotify_client(username=username)
     if sp:
-        sp.user_playlist_change_details(username, playlist_id, name=new_name)
+        _spotify_call(lambda: sp.user_playlist_change_details(username, playlist_id, name=new_name))
 
 def show_all_playlists(username):
     """Returns all playlists for a user."""
     sp = get_spotify_client(username=username)
     if sp:
-        return sp.user_playlists(username)
+        return _spotify_call(lambda: sp.user_playlists(username))
     return None
 
 def find_playlist_by_name(username, playlist_name):
@@ -125,14 +152,14 @@ def find_playlist_by_name(username, playlist_name):
     if not sp:
         return None
     
-    playlists = sp.user_playlists(username)
+    playlists = _spotify_call(lambda: sp.user_playlists(username))
     while playlists:
         for playlist in playlists['items']:
             if playlist['name'] == playlist_name:
                 return playlist['id']
         
         if playlists['next']:
-            playlists = sp.next(playlists)
+            playlists = _spotify_call(lambda: sp.next(playlists))
         else:
             playlists = None
     return None
@@ -220,10 +247,18 @@ def remove_song_from_spotify_playlist(username, track_id, playlist_id):
 
 def get_artist_info(sp, artist_spotify_id):
     """Returns all artist data: albums, songs, etc."""
-    artist_albums = sp.artist_albums(artist_spotify_id, country=COUNTRY)
-    album_ids = [album['id'] for album in artist_albums['items']]
-    
-    full_artist_info = sp.artist(artist_spotify_id)
+    artist_albums = _spotify_call(lambda: sp.artist_albums(artist_spotify_id, country=COUNTRY))
+    album_ids = []
+
+    # Paginate through all albums to avoid truncation
+    while artist_albums:
+        album_ids.extend([album['id'] for album in artist_albums.get('items', [])])
+        if artist_albums.get('next'):
+            artist_albums = _spotify_call(lambda: sp.next(artist_albums))
+        else:
+            artist_albums = None
+
+    full_artist_info = _spotify_call(lambda: sp.artist(artist_spotify_id)) or {}
 
     return {
         'album_data': get_album_info(sp, album_ids),
@@ -249,7 +284,10 @@ def get_album_info(sp, album_spotify_ids):
     # We should chunk if album_spotify_ids > 20
     for i in range(0, len(album_spotify_ids), 20):
         chunk = album_spotify_ids[i:i+20]
-        albums = sp.albums(chunk)
+        albums_resp = _spotify_call(lambda: sp.albums(chunk))
+        if not albums_resp:
+            continue
+        albums = albums_resp
 
         for album_info in albums['albums']:
             album_data = parse_album(album_info)
@@ -313,7 +351,11 @@ def search(sp, query, limit=50, offset=0, fetch_all=False):
     try:
         # Initial search to get total
         first_limit = 50 if (fetch_all or limit is None) else min(limit, 50)
-        results = sp.search(query, limit=first_limit, offset=offset, market=COUNTRY, type='track')
+        results = _spotify_call(lambda: sp.search(query, limit=first_limit, offset=offset, market=COUNTRY, type='track'))
+        if not results:
+            logger.error("Search failed to return results.")
+            all_results['tracks'] = []
+            return all_results
         items = results['tracks']['items']
         total = results['tracks']['total']
         tracks.extend(items)
@@ -342,7 +384,9 @@ def search(sp, query, limit=50, offset=0, fetch_all=False):
                     
                     while True:
                         try:
-                            yr = sp.search(year_query, limit=50, offset=year_offset, market=COUNTRY, type='track')
+                            yr = _spotify_call(lambda: sp.search(year_query, limit=50, offset=year_offset, market=COUNTRY, type='track'))
+                            if not yr:
+                                break
                             y_items = yr['tracks']['items']
                             if not y_items:
                                 break
@@ -380,7 +424,9 @@ def search(sp, query, limit=50, offset=0, fetch_all=False):
                                 logger.warning("Reached Spotify's 1000 item limit. Use year-specific queries to get more.")
                             break
                     
-                    res = sp.search(query, limit=fetch_size, offset=current_offset, market=COUNTRY, type='track')
+                    res = _spotify_call(lambda: sp.search(query, limit=fetch_size, offset=current_offset, market=COUNTRY, type='track'))
+                    if not res:
+                        break
                     new_items = res['tracks']['items']
                     if not new_items:
                         break
@@ -404,14 +450,17 @@ def search_tracks_by_year(sp, label, year, market='US'):
     query = f"label:\"{label}\" year:{year}"
     tracks = []
     try:
-        results = sp.search(q=query, limit=50, type='track', market=market)
+        results = _spotify_call(lambda: sp.search(query, limit=50, type='track', market=market))
         if not results:
             return []
-        
-        tracks.extend(results['tracks']['items'])
-        while results['tracks']['next']:
-            results = sp.next(results['tracks'])
-            tracks.extend(results['tracks']['items'])
+
+        page = results['tracks']
+        tracks.extend(page.get('items', []))
+        while page.get('next'):
+            page = _spotify_call(lambda: sp.next(page))
+            if not page:
+                break
+            tracks.extend(page.get('items', []))
     except Exception as e:
         logger.error(f"Error searching year {year}: {e}")
     
@@ -442,10 +491,42 @@ def search_tracks_exhaustive(sp, label, market='US'):
     logger.info(f"\nFinished scanning. Found {len(all_tracks)} unique tracks.")
     return all_tracks
 
-def validate_tracks_list(sp, tracks, target_label):
+
+def _build_label_map(sp, album_to_tracks):
+    """Build map of label -> associated tracks based on album metadata."""
+    label_map = {}
+    album_ids = list(album_to_tracks.keys())
+
+    for i in range(0, len(album_ids), 20):
+        chunk = album_ids[i:i+20]
+        albums_resp = _spotify_call(lambda: sp.albums(chunk))
+        if not albums_resp:
+            continue
+
+        for album in albums_resp.get('albums', []):
+            if not album:
+                continue
+
+            label = album.get('label')
+            if label not in label_map:
+                label_map[label] = []
+
+            if album.get('id') in album_to_tracks:
+                label_map[label].extend(album_to_tracks[album['id']])
+
+    return label_map
+
+def validate_tracks_list(sp, tracks, target_label, selection=None):
     """
     Validates a list of track objects against a target label.
     Returns a list of track IDs to KEEP.
+
+    selection (optional) controls non-interactive mode:
+    - None: prompt user (default, preserves current behavior)
+    - 'none': keep all
+    - 'suggested': exclude suggested mismatches
+    - list/tuple/set of indices (1-based) to exclude
+    - ('keep', [indices]) to keep only specified labels
     """
     logger.info(f"Validating {len(tracks)} tracks against label '{target_label}'...")
 
@@ -458,32 +539,8 @@ def validate_tracks_list(sp, tracks, target_label):
             album_to_tracks[album_id] = []
         album_to_tracks[album_id].append(track)
 
-    # Fetch Full Album Details (to get label)
-    album_ids = list(album_to_tracks.keys())
-    
-    # Map: label_name -> list of track objects
-    label_map = {}
-    
-    logger.info(f"Fetching details for {len(album_ids)} albums...")
-    
-    # Spotify allows fetching 20 albums at a time
-    for i in range(0, len(album_ids), 20):
-        chunk = album_ids[i:i+20]
-        try:
-            albums = sp.albums(chunk)['albums']
-            for album in albums:
-                if not album: continue
-                
-                label = album['label']
-                if label not in label_map:
-                    label_map[label] = []
-                
-                # Add all tracks associated with this album
-                if album['id'] in album_to_tracks:
-                    label_map[label].extend(album_to_tracks[album['id']])
-                    
-        except Exception as e:
-            logger.error(f"Error fetching albums: {e}")
+    logger.info(f"Fetching details for {len(album_to_tracks)} albums...")
+    label_map = _build_label_map(sp, album_to_tracks)
 
     # Interactive Validation
     if not label_map:
@@ -495,10 +552,11 @@ def validate_tracks_list(sp, tracks, target_label):
     
     # Identify likely mismatches for suggestion
     suggested_indices = []
-    
+    label_quality = []  # cache qualities for reuse in display/selection
+
     # Helper to determine match quality
     def get_match_quality(lbl, target):
-        n_lbl = lbl.lower().strip()
+        n_lbl = (lbl or "").lower().strip()
         n_target = target.lower().strip()
         
         if n_lbl == n_target: return 2 # Exact
@@ -506,61 +564,74 @@ def validate_tracks_list(sp, tracks, target_label):
         if n_target in n_lbl: return 1 # Loose Substring
         return 0 # No match
 
-    if console:
-        table = Table(title=f"Found {len(sorted_labels)} Unique Labels")
-        table.add_column("#", justify="right", style="cyan", no_wrap=True)
-        table.add_column("Match", justify="center")
-        table.add_column("Label Name", style="magenta")
-        table.add_column("Tracks", justify="right", style="green")
+    for i, (label, lbl_tracks) in enumerate(sorted_labels):
+        quality = get_match_quality(label, target_label)
+        label_quality.append(quality)
+        if quality < 2:
+            suggested_indices.append(str(i + 1))
 
-        for i, (label, lbl_tracks) in enumerate(sorted_labels):
-            quality = get_match_quality(label, target_label)
-            
-            if quality == 2:
-                match_status = "[green]✔[/green]"
-            elif quality == 1:
-                match_status = "[yellow]~[/yellow]"
-                suggested_indices.append(str(i + 1)) # Suggest removing loose matches by default
-            else:
-                match_status = "[red]✘[/red]"
-                suggested_indices.append(str(i + 1))
-            
-            table.add_row(str(i + 1), match_status, label, str(len(lbl_tracks)))
-        
-        console.print(table)
-        console.print(f"\n[bold]Suggested to remove (marked [red]✘[/red] and [yellow]~[/yellow]):[/bold] [yellow]{', '.join(suggested_indices) if suggested_indices else 'None'}[/yellow]")
-    else:
-        print(f"\n--- Found {len(sorted_labels)} unique labels ---")
-        
-        for i, (label, lbl_tracks) in enumerate(sorted_labels):
-            quality = get_match_quality(label, target_label)
-            
-            if quality == 2:
-                match_status = "✔"
-            elif quality == 1:
-                match_status = "~"
-                suggested_indices.append(str(i + 1))
-            else:
-                match_status = "X"
-                suggested_indices.append(str(i + 1))
-                
-            print(f"{i+1:3}. [{match_status}] {label} ({len(lbl_tracks)} tracks)")
-
-        print("\nLegend: [✔] = Strict Match, [~] = Loose Match, [X] = No Match")
-        print(f"Suggested to remove (marked X and ~): {', '.join(suggested_indices) if suggested_indices else 'None'}")
-    
-    print("\nOptions:")
-    print(" - Enter numbers to EXCLUDE (e.g. '1, 5').")
-    print(" - Type 'suggested' to exclude all [X] and [~] labels (Strict Mode).")
-    print(" - Type 'keep 1,2' to KEEP ONLY specific labels.")
-    print(" - Type 'none' or press Enter to keep ALL.")
-    
-    choice = input("> ").strip().lower()
-    
     indices_to_exclude = []
-    
+
+    def _collect_selection():
+        if selection is None:
+            if console:
+                table = Table(title=f"Found {len(sorted_labels)} Unique Labels")
+                table.add_column("#", justify="right", style="cyan", no_wrap=True)
+                table.add_column("Match", justify="center")
+                table.add_column("Label Name", style="magenta")
+                table.add_column("Tracks", justify="right", style="green")
+
+                for i, (label, lbl_tracks) in enumerate(sorted_labels):
+                    quality = label_quality[i]
+
+                    if quality == 2:
+                        match_status = "[green]✔[/green]"
+                    elif quality == 1:
+                        match_status = "[yellow]~[/yellow]"
+                    else:
+                        match_status = "[red]✘[/red]"
+
+                    table.add_row(str(i + 1), match_status, label, str(len(lbl_tracks)))
+
+                console.print(table)
+                console.print(f"\n[bold]Suggested to remove (marked [red]✘[/red] and [yellow]~[/yellow]):[/bold] [yellow]{', '.join(suggested_indices) if suggested_indices else 'None'}[/yellow]")
+            else:
+                print(f"\n--- Found {len(sorted_labels)} unique labels ---")
+
+                for i, (label, lbl_tracks) in enumerate(sorted_labels):
+                    quality = label_quality[i]
+
+                    if quality == 2:
+                        match_status = "✔"
+                    elif quality == 1:
+                        match_status = "~"
+                    else:
+                        match_status = "X"
+
+                    print(f"{i+1:3}. [{match_status}] {label} ({len(lbl_tracks)} tracks)")
+
+                print("\nLegend: [✔] = Strict Match, [~] = Loose Match, [X] = No Match")
+                print(f"Suggested to remove (marked X and ~): {', '.join(suggested_indices) if suggested_indices else 'None'}")
+
+            print("\nOptions:")
+            print(" - Enter numbers to EXCLUDE (e.g. '1, 5').")
+            print(" - Type 'suggested' to exclude all [X] and [~] labels (Strict Mode).")
+            print(" - Type 'keep 1,2' to KEEP ONLY specific labels.")
+            print(" - Type 'none' or press Enter to keep ALL.")
+
+            return input("> ").strip().lower()
+        # Non-interactive selection provided
+        if isinstance(selection, str):
+            return selection.strip().lower()
+        if isinstance(selection, tuple) and len(selection) == 2 and selection[0] == 'keep':
+            return f"keep {','.join([str(x) for x in selection[1]])}"
+        if isinstance(selection, (list, tuple, set)):
+            return ','.join([str(x) for x in selection])
+        return ''
+
+    choice = _collect_selection()
+
     if choice.startswith('keep '):
-        # Invert selection: User lists what to KEEP
         try:
             parts = choice[5:].split(',')
             keepers = []
@@ -569,8 +640,7 @@ def validate_tracks_list(sp, tracks, target_label):
                     idx = int(p.strip()) - 1
                     if 0 <= idx < len(sorted_labels):
                         keepers.append(idx)
-            
-            # Exclude everything NOT in keepers
+
             indices_to_exclude = [i for i in range(len(sorted_labels)) if i not in keepers]
             logger.info(f"Keeping {len(keepers)} labels, excluding {len(indices_to_exclude)}.")
         except ValueError:
@@ -584,7 +654,7 @@ def validate_tracks_list(sp, tracks, target_label):
         indices_to_exclude = [int(x) - 1 for x in suggested_indices]
     else:
         try:
-            parts = choice.split(',')
+            parts = choice.split(',') if choice else []
             for p in parts:
                 if p.strip():
                     idx = int(p.strip()) - 1
@@ -697,7 +767,7 @@ def remove_specific_occurrences(username, playlist_id, tracks_with_positions, pr
     for i in range(0, len(tracks_with_positions), 100):
         chunk = tracks_with_positions[i:i+100]
         try:
-            sp.user_playlist_remove_specific_occurrences_of_tracks(username, playlist_id, chunk)
+            _spotify_call(lambda: sp.user_playlist_remove_specific_occurrences_of_tracks(username, playlist_id, chunk))
             if progress_callback:
                 progress_callback(len(chunk))
             else:
@@ -705,10 +775,11 @@ def remove_specific_occurrences(username, playlist_id, tracks_with_positions, pr
         except Exception as e:
             logger.error(f"Error removing tracks: {e}")
 
-def validate_playlist_tracks(sp, playlist_id, username, target_label):
+def validate_playlist_tracks(sp, playlist_id, username, target_label, selection=None):
     """
     Validates that tracks in the playlist belong to the target label.
     Removes incorrect tracks.
+    selection: optional non-interactive choice (same semantics as validate_tracks_list)
     """
     logger.info("Validating playlist tracks against label...")
     
@@ -737,32 +808,8 @@ def validate_playlist_tracks(sp, playlist_id, username, target_label):
             album_to_tracks[album_id] = []
         album_to_tracks[album_id].append(track['id'])
 
-    # 3. Fetch Full Album Details (to get label)
-    album_ids = list(album_to_tracks.keys())
-    
-    # Map: label_name -> list of track_ids
-    label_map = {}
-    
-    logger.info(f"Fetching details for {len(album_ids)} albums...")
-    
-    # Spotify allows fetching 20 albums at a time
-    for i in range(0, len(album_ids), 20):
-        chunk = album_ids[i:i+20]
-        try:
-            albums = sp.albums(chunk)['albums']
-            for album in albums:
-                if not album: continue
-                
-                label = album['label']
-                if label not in label_map:
-                    label_map[label] = []
-                
-                # Add all tracks associated with this album
-                if album['id'] in album_to_tracks:
-                    label_map[label].extend(album_to_tracks[album['id']])
-                    
-        except Exception as e:
-            logger.error(f"Error fetching albums: {e}")
+    logger.info(f"Fetching details for {len(album_to_tracks)} albums...")
+    label_map = _build_label_map(sp, album_to_tracks)
 
     # 4. Interactive Validation
     if not label_map:
@@ -773,30 +820,38 @@ def validate_playlist_tracks(sp, playlist_id, username, target_label):
     sorted_labels = sorted(label_map.items(), key=lambda x: len(x[1]), reverse=True)
     
     print(f"\n--- Found {len(sorted_labels)} unique labels ---")
-    
+
     # Identify likely mismatches for suggestion
     suggested_indices = []
-    
+
     for i, (label, tracks) in enumerate(sorted_labels):
-        # Check if target label is in the label name (case-insensitive)
-        is_match = target_label.lower() in label.lower()
-        match_status = " " if is_match else "X" # Mark mismatches with X
-        
+        label_val = label or ""
+        is_match = target_label.lower() in label_val.lower()
+        match_status = " " if is_match else "X"
+
         if not is_match:
             suggested_indices.append(str(i + 1))
-            
-        print(f"{i+1:3}. [{match_status}] {label} ({len(tracks)} tracks)")
+
+        print(f"{i+1:3}. [{match_status}] {label_val} ({len(tracks)} tracks)")
 
     print("\nLegend: [ ] = Contains search term, [X] = Does not contain search term")
     print(f"Suggested to remove (marked X): {', '.join(suggested_indices) if suggested_indices else 'None'}")
-    
-    print("\nEnter the numbers of the labels you want to REMOVE (comma separated, e.g. '1, 5, 10').")
-    print("Type 'suggested' to remove all [X] labels.")
-    print("Type 'none' or press Enter to keep all.")
-    
-    choice = input("> ").strip().lower()
-    
+
     indices_to_remove = []
+
+    if selection is None:
+        print("\nEnter the numbers of the labels you want to REMOVE (comma separated, e.g. '1, 5, 10').")
+        print("Type 'suggested' to remove all [X] labels.")
+        print("Type 'none' or press Enter to keep all.")
+        choice = input("> ").strip().lower()
+    else:
+        if isinstance(selection, str):
+            choice = selection.strip().lower()
+        elif isinstance(selection, (list, tuple, set)):
+            choice = ','.join([str(x) for x in selection])
+        else:
+            choice = ''
+
     if choice in ('none', ''):
         logger.info("Keeping all tracks.")
         return
@@ -804,7 +859,7 @@ def validate_playlist_tracks(sp, playlist_id, username, target_label):
         indices_to_remove = [int(x) - 1 for x in suggested_indices]
     else:
         try:
-            parts = choice.split(',')
+            parts = choice.split(',') if choice else []
             for p in parts:
                 if p.strip():
                     idx = int(p.strip()) - 1

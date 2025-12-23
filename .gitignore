@@ -1,3 +1,6 @@
+#tests
+tests
+
 # Compiled Python files
 *.pyc
 
@@ -13,7 +16,7 @@ Thumbs.db
 .Spotlight-V100
 .Trashes
 .cache*
-./cache
+cache
 # Environment variables
 .env
 .venv
