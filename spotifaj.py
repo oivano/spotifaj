@@ -977,6 +977,13 @@ def parse_track_input(line):
     if '|' in line:
         line = line.split('|')[0].strip()
     
+    # Remove common metadata patterns in parentheses
+    # Examples: (taken from Album, Year), (Album Version), (feat. Artist), etc.
+    # Keep version info like (Remix), (Radio Edit) as those are important for matching
+    line = re.sub(r'\s*\(taken from[^)]+\)', '', line, flags=re.IGNORECASE)
+    line = re.sub(r'\s*\(from[^)]+\d{4}[^)]*\)', '', line, flags=re.IGNORECASE)  # (from Album, 2004)
+    line = re.sub(r'\s*\(released (?:on|in)[^)]+\)', '', line, flags=re.IGNORECASE)  # (released on 12'' By BBE in 2003)
+    
     # Common separators (including all dash types)
     separators = [' - ', ' – ', ' — ', ': ']
     
@@ -1206,6 +1213,8 @@ def import_playlist(input_file, name, username):
                 def normalize_for_search(text):
                     if not text:
                         return ""
+                    # Remove apostrophes (Yesterday's -> Yesterdays)
+                    text = text.replace("'", "").replace("'", "")
                     # Remove dashes, pipes, and other separators
                     text = re.sub(r'[-–—|/]', ' ', text)
                     # Collapse multiple spaces
