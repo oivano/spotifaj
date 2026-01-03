@@ -8,6 +8,9 @@ import sys
 import os
 import re
 import time
+import base64
+import requests
+from io import BytesIO
 from difflib import SequenceMatcher
 from rich.console import Console
 from rich.markup import escape
@@ -21,7 +24,17 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from config import settings, logger
+from constants import (
+    CONFIDENCE_THRESHOLD_AUTO_ACCEPT,
+    SIMILARITY_THRESHOLD_ARTIST_INTENT,
+    SIMILARITY_THRESHOLD_ALBUM_INTENT,
+    SPOTIFY_SEARCH_DEFAULT_LIMIT,
+    SPOTIFY_SEARCH_RESULT_LIMIT,
+    DEFAULT_DISPLAY_LIMIT,
+    SPOTIFY_DEFAULT_DELAY,
+)
 import spotifaj_functions
+from fuzzywuzzy import fuzz
 
 # Import new modules
 try:
@@ -36,7 +49,7 @@ except ImportError as e:
     SpotifyLabelWorkflow = None
 
 console = Console()
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 @click.group()
 @click.version_option(__version__)
@@ -443,8 +456,8 @@ def list_playlists(username):
 @click.option('--artist', is_flag=True, help="Filter results by artist.")
 @click.option('--album', is_flag=True, help="Filter results by album.")
 @click.option('--track', is_flag=True, help="Filter results by track.")
-@click.option('--limit', default=50, help="Number of tracks to fetch (default 50).")
-@click.option('--all', 'fetch_all', is_flag=True, help="Fetch all results (up to 1000).")
+@click.option('--limit', default=SPOTIFY_SEARCH_DEFAULT_LIMIT, help=f"Number of tracks to fetch (default {SPOTIFY_SEARCH_DEFAULT_LIMIT}).")
+@click.option('--all', 'fetch_all', is_flag=True, help=f"Fetch all results (up to {SPOTIFY_SEARCH_RESULT_LIMIT}).")
 def search_and_add(query, username, playlist, artist, album, track, limit, fetch_all):
     """Search for tracks by query and add to a new playlist."""
     playlist_name = playlist if playlist else f"Search: {query}"
@@ -477,7 +490,7 @@ def search_and_add(query, username, playlist, artist, album, track, limit, fetch
                 artist_obj = intent_results['artists']['items'][0]
                 score = SequenceMatcher(None, query.lower(), artist_obj['name'].lower()).ratio()
                 # Boost artist score slightly as it's a common intent for "Name" queries
-                if score > 0.8: 
+                if score > SIMILARITY_THRESHOLD_ARTIST_INTENT: 
                     best_score = score
                     best_type = 'artist'
                     best_match_name = artist_obj['name']
@@ -486,7 +499,7 @@ def search_and_add(query, username, playlist, artist, album, track, limit, fetch
             if intent_results.get('albums', {}).get('items'):
                 album_obj = intent_results['albums']['items'][0]
                 score = SequenceMatcher(None, query.lower(), album_obj['name'].lower()).ratio()
-                if score > best_score and score > 0.9:
+                if score > best_score and score > SIMILARITY_THRESHOLD_ALBUM_INTENT:
                     best_score = score
                     best_type = 'album'
                     best_match_name = album_obj['name']
@@ -500,11 +513,11 @@ def search_and_add(query, username, playlist, artist, album, track, limit, fetch
                 # So we only default to track if Artist/Album scores are low.
                 pass 
 
-            if best_type == 'artist' and best_score > 0.8:
+            if best_type == 'artist' and best_score > SIMILARITY_THRESHOLD_ARTIST_INTENT:
                 logger.info(f"Detected Artist intent: '{best_match_name}' (Confidence: {best_score:.2f})")
                 # Use original query to avoid incorrect auto-correction (e.g. Igor Jadranin -> Igor Garanin)
                 search_query = f"artist:{query}"
-            elif best_type == 'album' and best_score > 0.9:
+            elif best_type == 'album' and best_score > SIMILARITY_THRESHOLD_ALBUM_INTENT:
                 logger.info(f"Detected Album intent: '{best_match_name}' (Confidence: {best_score:.2f})")
                 search_query = f"album:{query}"
             else:
@@ -529,9 +542,9 @@ def search_and_add(query, username, playlist, artist, album, track, limit, fetch
     if total_tracks == 0:
         return
 
-    # Display tracks (limit to 20 by default unless user asked for more via limit option explicitly?)
-    # User requirement: "per default if no option provided - display only first 20"
-    display_limit = 20
+    # Display tracks (limit to DEFAULT_DISPLAY_LIMIT by default unless user asked for more via limit option explicitly?)
+    # User requirement: "per default if no option provided - display only first DEFAULT_DISPLAY_LIMIT"
+    display_limit = DEFAULT_DISPLAY_LIMIT
     
     for i, track in enumerate(tracks):
         if i >= display_limit:
@@ -642,7 +655,7 @@ def deduplicate(playlist_input, username, check_all, dry_run):
 
         for pl in playlists_to_check:
             # Be polite to the API
-            time.sleep(0.2)
+            time.sleep(SPOTIFY_DEFAULT_DELAY)
             
             name = pl['name']
             pid = pl['id']
@@ -814,6 +827,320 @@ def export_playlist(playlist_input, username):
     except Exception as e:
         logger.error(f"Error exporting playlist: {e}")
 
+
+def upload_playlist_cover(sp, playlist_id, image_url):
+    """
+    Download an image from URL and upload it as playlist cover.
+    
+    Args:
+        sp: Spotify client
+        playlist_id: Spotify playlist ID
+        image_url: URL to JPEG image
+    
+    Raises:
+        Exception: If download or upload fails
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        raise Exception("Pillow is required for image processing. Install it with: pip install Pillow")
+    
+    try:
+        # Download image
+        logger.info(f"Downloading image from {image_url}...")
+        response = requests.get(image_url, timeout=10)
+        response.raise_for_status()
+        
+        # Open image with PIL
+        img = Image.open(BytesIO(response.content))
+        
+        # Convert to RGB if needed (for PNG with transparency, etc.)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Start with original dimensions
+        width, height = img.size
+        logger.debug(f"Original image size: {width}x{height}")
+        
+        # Spotify recommends max dimensions and requires < 256KB
+        # Start with reasonable dimensions and aggressive compression
+        max_dimension = 640  # Spotify shows at 300x300, so 640 is safe
+        
+        # Resize if too large
+        if width > max_dimension or height > max_dimension:
+            if width > height:
+                new_width = max_dimension
+                new_height = int(height * (max_dimension / width))
+            else:
+                new_height = max_dimension
+                new_width = int(width * (max_dimension / height))
+            
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            logger.debug(f"Resized to: {new_width}x{new_height}")
+        
+        # Compress to fit under 256KB (accounting for base64 encoding overhead)
+        # Base64 adds exactly 4/3 overhead (33.33%), so aim for max 180KB raw data to be safe
+        MAX_RAW_SIZE = 180 * 1024  # 180KB raw = 240KB encoded (safe margin under 256KB)
+        
+        quality = 90
+        buffer = BytesIO()
+        img.save(buffer, format='JPEG', quality=quality, optimize=True)
+        image_data = buffer.getvalue()
+        
+        logger.debug(f"Initial compression at quality {quality}: {len(image_data)} bytes")
+        
+        # Reduce quality until it fits
+        while len(image_data) > MAX_RAW_SIZE and quality > 30:
+            quality -= 5
+            buffer = BytesIO()
+            img.save(buffer, format='JPEG', quality=quality, optimize=True)
+            image_data = buffer.getvalue()
+            logger.debug(f"Compressed to quality {quality}: {len(image_data)} bytes")
+        
+        # If still too large, reduce dimensions further
+        current_width, current_height = img.size
+        while len(image_data) > MAX_RAW_SIZE and current_width > 300:
+            # Reduce by 10% each iteration
+            current_width = int(current_width * 0.9)
+            current_height = int(current_height * 0.9)
+            
+            img = img.resize((current_width, current_height), Image.Resampling.LANCZOS)
+            buffer = BytesIO()
+            img.save(buffer, format='JPEG', quality=quality, optimize=True)
+            image_data = buffer.getvalue()
+            logger.debug(f"Resized to {current_width}x{current_height}, {len(image_data)} bytes")
+        
+        if len(image_data) > MAX_RAW_SIZE:
+            raise Exception(f"Image too large even after compression ({len(image_data)} bytes raw, ~{int(len(image_data) * 1.33)} bytes encoded, max 256KB encoded)")
+        
+        logger.info(f"Final image: {len(image_data)} bytes (quality={quality}, size={img.size})")
+        
+        # Encode to base64
+        encoded_image = base64.b64encode(image_data).decode('utf-8')
+        
+        # Upload to Spotify
+        sp.playlist_upload_cover_image(playlist_id, encoded_image)
+        
+    except requests.RequestException as e:
+        raise Exception(f"Failed to download image: {e}")
+    except Exception as e:
+        raise Exception(f"Failed to process/upload image: {e}")
+
+
+def normalize_text_for_matching(text):
+    """
+    Normalize text for fuzzy matching.
+    
+    - Normalizes all dash types and separators
+    - Removes content after | pipe
+    - Case insensitive
+    - Collapses multiple spaces
+    
+    Args:
+        text: Raw text string
+        
+    Returns:
+        str: Normalized text (lowercase)
+    """
+    if not text:
+        return ""
+    
+    # Remove content after pipe separator
+    if '|' in text:
+        text = text.split('|')[0].strip()
+    
+    # Normalize all dash types and separators to space
+    text = re.sub(r'[-–—―‐‑‒−/|]', ' ', text)
+    
+    # Collapse multiple spaces to single space
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text.lower()
+
+
+def parse_track_input(line):
+    """
+    Parse a track input line to extract artist and track name.
+    
+    Supports various formats:
+    - Artist - Track
+    - Artist | Track
+    - Artist – Track (em dash)
+    - Artist: Track
+    - Artist featuring Artist2 - Track
+    
+    Returns:
+        tuple: (artist, track_name, all_artists) where all_artists is the full artist string
+    """
+    # Don't normalize yet - we need separators to parse!
+    # Just clean up the pipe content first
+    if '|' in line:
+        line = line.split('|')[0].strip()
+    
+    # Common separators (including all dash types)
+    separators = [' - ', ' – ', ' — ', ': ']
+    
+    for sep in separators:
+        if sep in line:
+            parts = line.split(sep, 1)
+            if len(parts) == 2:
+                artist_part = parts[0].strip()
+                track = parts[1].strip()
+                
+                # Extract primary artist and normalize featuring/feat/ft patterns
+                primary_artist, all_artists = normalize_artist_string(artist_part)
+                
+                return primary_artist, track, all_artists
+    
+    # If no separator found, return the whole line as track name
+    return None, line.strip(), None
+
+
+def normalize_artist_string(artist_str):
+    """
+    Normalize artist string to handle featuring/feat/ft patterns.
+    
+    Args:
+        artist_str: Raw artist string (e.g., "Navy Blue featuring Billy Woods")
+        
+    Returns:
+        tuple: (primary_artist, normalized_all_artists)
+    """
+    # Patterns for featuring
+    featuring_patterns = [
+        r'\s+featuring\s+',
+        r'\s+feat\.?\s+',
+        r'\s+ft\.?\s+',
+        r'\s+with\s+',
+        r'\s+&\s+',
+    ]
+    
+    # Extract primary artist (before any featuring pattern)
+    primary_artist = artist_str
+    for pattern in featuring_patterns:
+        match = re.split(pattern, artist_str, maxsplit=1, flags=re.IGNORECASE)
+        if len(match) > 1:
+            primary_artist = match[0].strip()
+            break
+    
+    # Return both primary artist and the full string (for broader matching)
+    return primary_artist, artist_str
+
+
+def calculate_match_confidence(search_result, expected_artist, expected_track, expected_all_artists=None):
+    """
+    Calculate confidence score for a search result match.
+    
+    Args:
+        search_result: Spotify track object
+        expected_artist: Expected primary artist name
+        expected_track: Expected track name
+        expected_all_artists: Full artist string including features
+        
+    Returns:
+        int: Confidence score (0-100)
+    """
+    if not search_result:
+        return 0
+    
+    confidence = 0
+    
+    # Get actual values from search result
+    actual_track = search_result.get('name', '')
+    actual_artists = [artist['name'] for artist in search_result.get('artists', [])]
+    actual_artist_str = ', '.join(actual_artists)
+    
+    # Normalize for comparison
+    expected_track_norm = normalize_text_for_matching(expected_track).lower() if expected_track else ""
+    actual_track_norm = normalize_text_for_matching(actual_track).lower()
+    
+    # Remove common suffixes from track names for better matching
+    # (Radio Edit, Remix, Remaster, etc. shouldn't reduce confidence)
+    def strip_track_suffixes(track):
+        suffixes = [
+            r'\s*radio\s+edit.*$',
+            r'\s*single\s+edit.*$',
+            r'\s*album\s+version.*$',
+            r'\s*original\s+mix.*$',
+            r'\s*remaster.*$',
+            r'\s*remix.*$',
+            r'\s*\d{4}\s+remaster.*$',
+        ]
+        for suffix in suffixes:
+            track = re.sub(suffix, '', track, flags=re.IGNORECASE)
+        return track.strip()
+    
+    expected_track_clean = strip_track_suffixes(expected_track_norm)
+    actual_track_clean = strip_track_suffixes(actual_track_norm)
+    
+    # Track name matching (50 points max)
+    if expected_track:
+        track_similarity = SequenceMatcher(None, expected_track_clean, actual_track_clean).ratio()
+        confidence += int(track_similarity * 50)
+        
+        # Bonus for original/radio versions over remixes
+        # If the expected track doesn't mention a remix, prefer original versions
+        if not re.search(r'\b(remix|mix|edit)\b', expected_track, re.IGNORECASE):
+            # Check if actual track is a remix (but not radio/single edit)
+            if re.search(r'\b(remix|mix)\b', actual_track, re.IGNORECASE):
+                # Don't penalize Radio Edit or Single Edit
+                if not re.search(r'\b(radio|single|original)\s+(edit|mix|version)\b', actual_track, re.IGNORECASE):
+                    # Heavy penalize other remixes by 20 points
+                    confidence = max(0, confidence - 20)
+            # Boost Radio Edit / Original Mix / Single Edit by 10 points
+            elif re.search(r'\b(radio|single|original)\s+(edit|mix|version)\b', actual_track, re.IGNORECASE):
+                confidence = min(100, confidence + 10)
+            # Also boost if it's just the plain track (no version info)
+            elif not re.search(r'\b(version|edit|mix|live|acoustic|instrumental)\b', actual_track, re.IGNORECASE):
+                confidence = min(100, confidence + 5)
+    
+    # Artist matching (50 points max)
+    if expected_artist:
+        # Normalize expected artist
+        expected_artist_norm = normalize_text_for_matching(expected_artist).lower()
+        # Check against all artists in the track
+        artist_scores = []
+        
+        # 1. Check primary artist match (with normalization)
+        for actual_artist in actual_artists:
+            actual_artist_norm = normalize_text_for_matching(actual_artist).lower()
+            score = SequenceMatcher(None, expected_artist_norm, actual_artist_norm).ratio()
+            artist_scores.append(score)
+        
+        # 2. Also check if any words from expected_all_artists appear in actual artists
+        if expected_all_artists:
+            # Extract artist names from the full string
+            expected_names = re.split(r'\s+(?:featuring|feat\.?|ft\.?|with|&|,)\s+', expected_all_artists, flags=re.IGNORECASE)
+            for expected_name in expected_names:
+                expected_name_norm = normalize_text_for_matching(expected_name.strip()).lower()
+                for actual_artist in actual_artists:
+                    actual_artist_norm = normalize_text_for_matching(actual_artist).lower()
+                    score = SequenceMatcher(None, expected_name_norm, actual_artist_norm).ratio()
+                    artist_scores.append(score)
+        
+        # Use best artist match
+        if artist_scores:
+            best_artist_match = max(artist_scores)
+            confidence += int(best_artist_match * 50)
+            
+            # Strict penalty if artist match is poor
+            # Even "similar" artist names like Anushka vs Anouk should be penalized
+            if best_artist_match < 0.3:
+                # Extremely poor match - basically reject it
+                confidence = int(confidence * 0.2)  # Reduce by 80%
+            elif best_artist_match < 0.5:
+                # Poor match
+                confidence = int(confidence * 0.4)  # Reduce by 60%
+            elif best_artist_match < 0.75:
+                # Moderate match - similar but not exact (Anushka vs Anouk)
+                confidence = int(confidence * 0.6)  # Reduce by 40%
+    else:
+        # No artist specified, only use track matching (less reliable)
+        confidence = int(confidence * 0.7)  # Reduce confidence when no artist
+    
+    return min(confidence, 100)
+
+
 @spotifaj.command()
 @click.argument('input_file', type=click.File('r'), required=False)
 @click.option('--name', '-n', required=True, help="Name of the new playlist.")
@@ -841,13 +1168,14 @@ def import_playlist(input_file, name, username):
         logger.warning("No input provided.")
         return
 
-    sp = spotifaj_functions.get_spotify_client(username=username, scope="playlist-modify-public playlist-modify-private")
+    sp = spotifaj_functions.get_spotify_client(username=username, scope="playlist-modify-public playlist-modify-private ugc-image-upload")
     if not sp:
         logger.error("Failed to initialize Spotify client.")
         sys.exit(1)
 
     track_uris = []
     not_found = []
+    low_confidence_matches = []
     
     logger.info(f"Processing {len(lines)} lines...")
     
@@ -859,7 +1187,7 @@ def import_playlist(input_file, name, username):
     ) as progress:
         task = progress.add_task("Searching tracks...", total=len(lines))
         
-        for line in lines:
+        for line_num, line in enumerate(lines):
             line = line.strip()
             if not line:
                 progress.advance(task)
@@ -871,12 +1199,89 @@ def import_playlist(input_file, name, username):
                 continue
 
             try:
-                # Search for the track
-                results = sp.search(q=line, limit=1, type='track')
-                items = results['tracks']['items']
+                # Parse the input to extract artist and track
+                artist, track, all_artists = parse_track_input(line)
                 
-                if items:
-                    track_uris.append(items[0]['uri'])
+                # Normalize search terms by removing special characters for better matching
+                def normalize_for_search(text):
+                    if not text:
+                        return ""
+                    # Remove dashes, pipes, and other separators
+                    text = re.sub(r'[-–—|/]', ' ', text)
+                    # Collapse multiple spaces
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    return text
+                
+                # Try multiple search strategies for better results
+                search_queries = []
+                
+                if artist and track:
+                    # Normalize both artist and track for search
+                    artist_norm = normalize_for_search(artist)
+                    track_norm = normalize_for_search(track)
+                    
+                    # Strategy 1: Simple artist + track (flexible, works for most cases)
+                    search_queries.append(f"{artist_norm} {track_norm}")
+                    
+                    # Strategy 2: Track name only (fallback for rare/misspelled artists)
+                    search_queries.append(f"{track_norm}")
+                else:
+                    # Fallback: search the whole line (normalized)
+                    search_queries.append(normalize_for_search(track or line))
+                
+                # Collect results from all search strategies
+                all_items = []
+                seen_uris = set()
+                
+                for search_query in search_queries:
+                    try:
+                        results = sp.search(q=search_query, limit=25, type='track')
+                        items = results['tracks']['items']
+                        # Deduplicate by URI
+                        for item in items:
+                            if item['uri'] not in seen_uris:
+                                all_items.append(item)
+                                seen_uris.add(item['uri'])
+                    except Exception as search_err:
+                        logger.debug(f"Search query '{search_query}' failed: {search_err}")
+                        continue
+                
+                if all_items:
+                    # Calculate confidence for each result
+                    best_match = None
+                    best_confidence = 0
+                    
+                    for item in all_items:
+                        confidence = calculate_match_confidence(item, artist, track, all_artists)
+                        if confidence > best_confidence:
+                            best_confidence = confidence
+                            best_match = item
+                        
+                        # Debug: log all candidates with confidence > 30% for manual review
+                        if confidence >= 30:
+                            logger.debug(f"Candidate: {', '.join([a['name'] for a in item['artists']])} - {item['name']} ({confidence}%)")
+                    
+                    # Accept match based on confidence
+                    # Minimum threshold: don't suggest garbage matches
+                    MIN_SUGGESTION_CONFIDENCE = 40
+                    
+                    if best_match and best_confidence >= MIN_SUGGESTION_CONFIDENCE:
+                        track_info = {
+                            'uri': best_match['uri'],
+                            'input': line,
+                            'found': f"{', '.join([a['name'] for a in best_match['artists']])} - {best_match['name']}",
+                            'confidence': best_confidence,
+                            'line_num': line_num  # Preserve original order
+                        }
+                        
+                        if best_confidence >= CONFIDENCE_THRESHOLD_AUTO_ACCEPT:
+                            track_uris.append(track_info)
+                        else:
+                            # Low confidence - save for manual review
+                            low_confidence_matches.append(track_info)
+                    else:
+                        # No match above minimum threshold
+                        not_found.append(line)
                 else:
                     not_found.append(line)
             except Exception as e:
@@ -886,7 +1291,24 @@ def import_playlist(input_file, name, username):
             progress.advance(task)
 
     # Report results
-    console.print(f"\n[bold]Found {len(track_uris)} tracks.[/bold]")
+    console.print(f"\n[bold]Found {len(track_uris)} high-confidence matches.[/bold]")
+    
+    # Handle low-confidence matches
+    if low_confidence_matches:
+        console.print(f"\n[yellow]Found {len(low_confidence_matches)} low-confidence matches:[/yellow]")
+        for match in low_confidence_matches:
+            console.print(f"  Input: [cyan]{match['input']}[/cyan]")
+            console.print(f"  Found: [magenta]{match['found']}[/magenta] (confidence: {match['confidence']}%)")
+            if spotifaj_functions.confirm("  Include this track?", default=False):
+                track_uris.append(match)
+            console.print()
+    
+    # Sort all tracks by original line number to preserve input order
+    track_uris.sort(key=lambda x: x['line_num'])
+    
+    # Extract just the URIs in the correct order
+    final_track_uris = [t['uri'] for t in track_uris]
+    
     if not_found:
         console.print(f"[red]Could not find {len(not_found)} tracks:[/red]")
         for nf in not_found[:10]:
@@ -894,16 +1316,25 @@ def import_playlist(input_file, name, username):
         if len(not_found) > 10:
             console.print(f"  ... and {len(not_found) - 10} more.")
 
-    if not track_uris:
+    if not final_track_uris:
         logger.warning("No tracks found to add.")
         return
 
     # Create playlist
-    if spotifaj_functions.confirm(f"Create playlist '{name}' with {len(track_uris)} tracks?", default=True):
-        playlist_id = spotifaj_functions.create_playlist(username, name)
+    if spotifaj_functions.confirm(f"Create playlist '{name}' with {len(final_track_uris)} tracks?", default=True):
+        playlist_id = spotifaj_functions.create_playlist(username, name, sp=sp)
         if playlist_id:
-            spotifaj_functions.add_song_to_spotify_playlist(username, track_uris, playlist_id)
+            spotifaj_functions.add_song_to_spotify_playlist(username, final_track_uris, playlist_id, sp=sp)
             console.print(f"[bold green]Successfully created playlist '{name}'![/bold green]")
+            
+            # Offer to add cover image
+            if spotifaj_functions.confirm("\nWould you like to add a cover image?", default=False):
+                image_url = click.prompt("Enter image URL (JPEG)", type=str)
+                try:
+                    upload_playlist_cover(sp, playlist_id, image_url)
+                    console.print("[green]Cover image uploaded successfully![/green]")
+                except Exception as e:
+                    console.print(f"[red]Failed to upload cover image: {e}[/red]")
         else:
             logger.error("Failed to create playlist.")
 

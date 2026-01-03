@@ -1,9 +1,11 @@
-spotipy
-python-dotenv
+aiohttp
 click
+discogs-client
+fuzzywuzzypyyaml
+Pillow
 pydantic
 pydantic-settings
-aiohttp
+python-dotenv
 rich
-discogs-client
-Pillow
+spotipy
+pyyaml

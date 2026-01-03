@@ -11,6 +11,11 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 import discogs_client
+from constants import (
+    DISCOGS_RATE_LIMIT_PER_MINUTE,
+    DISCOGS_MAX_RETRIES,
+    DISCOGS_RETRY_AFTER_BUFFER,
+)
 
 logger = logging.getLogger('discogs_client')
 
@@ -42,7 +47,7 @@ class DiscogsClient:
         self.cache_manager = cache_manager
         
         # Initialize rate limiting parameters - more conservative defaults
-        self.rate_limit_per_minute = 25  # Default to 25/minute (Discogs recommends below 60)
+        self.rate_limit_per_minute = DISCOGS_RATE_LIMIT_PER_MINUTE  # Default (Discogs recommends below 60)
         self.min_request_interval = 60.0 / self.rate_limit_per_minute  # Dynamic calculation
         self.last_request_time = 0
         
@@ -94,7 +99,7 @@ class DiscogsClient:
         self.token_bucket -= 1
         self.last_request_time = time.time()
     
-    def _request_with_backoff(self, func, *args, max_retries=5, **kwargs):
+    def _request_with_backoff(self, func, *args, max_retries=DISCOGS_MAX_RETRIES, **kwargs):
         """
         Execute a Discogs API call with exponential backoff for failures.
         """

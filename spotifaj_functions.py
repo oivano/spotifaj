@@ -4,10 +4,22 @@ Helper functions for Spotify interactions.
 
 import datetime
 import time
+from typing import Optional, List, Dict, Any, Callable, Set, Tuple
 import spotipy
 import spotipy.util as util
 from spotipy.oauth2 import SpotifyClientCredentials
 from config import settings, logger
+from constants import (
+    SPOTIFY_MAX_RETRIES,
+    SPOTIFY_RETRY_BACKOFF_BASE,
+    SPOTIFY_REQUEST_TIMEOUT,
+    SPOTIFY_PLAYLIST_ADD_BATCH_SIZE,
+    SPOTIFY_ALBUM_FETCH_BATCH_SIZE,
+    DEFAULT_COUNTRY_CODE,
+    YEAR_SEARCH_START,
+    YEAR_SEARCH_END,
+    DURATION_BUCKET_SIZE_MS,
+)
 
 # Import advanced deduplication logic
 try:
@@ -34,10 +46,10 @@ DEFAULT_SCOPE = (
     "user-library-read"
 )
 
-COUNTRY = 'US'
+COUNTRY = DEFAULT_COUNTRY_CODE
 
 
-def _spotify_call(fn, retries=3, backoff=1.5):
+def _spotify_call(fn: Callable, retries: int = SPOTIFY_MAX_RETRIES, backoff: float = SPOTIFY_RETRY_BACKOFF_BASE) -> Optional[Any]:
     """Call a Spotify API function with simple retry/backoff for 429/5xx."""
     for attempt in range(retries):
         try:
@@ -63,7 +75,7 @@ def _spotify_call(fn, retries=3, backoff=1.5):
             logger.error(f"Unexpected Spotify call error: {e}")
             return None
 
-def get_spotify_client(username=None, scope=DEFAULT_SCOPE):
+def get_spotify_client(username: Optional[str] = None, scope: str = DEFAULT_SCOPE) -> Optional[spotipy.Spotify]:
     """
     Returns an authenticated spotipy.Spotify client.
     
@@ -82,7 +94,7 @@ def get_spotify_client(username=None, scope=DEFAULT_SCOPE):
             )
             if token:
                 # Disable internal retries to handle them manually and avoid long hangs
-                return spotipy.Spotify(auth=token, requests_timeout=20, retries=0)
+                return spotipy.Spotify(auth=token, requests_timeout=SPOTIFY_REQUEST_TIMEOUT, retries=0)
             else:
                 logger.error(f"Can't get token for {username}")
                 return None
@@ -96,9 +108,9 @@ def get_spotify_client(username=None, scope=DEFAULT_SCOPE):
             client_secret=settings.spotipy_client_secret
         )
         # Disable internal retries to handle them manually and avoid long hangs
-        return spotipy.Spotify(client_credentials_manager=client_credentials_manager, requests_timeout=20, retries=0)
+        return spotipy.Spotify(client_credentials_manager=client_credentials_manager, requests_timeout=SPOTIFY_REQUEST_TIMEOUT, retries=0)
 
-def confirm(prompt=None, default=False):
+def confirm(prompt: Optional[str] = None, default: bool = False) -> bool:
     """
     Prompts for yes or no response from the user.
     Returns True for yes and False for no.
@@ -121,9 +133,10 @@ def confirm(prompt=None, default=False):
             return False
         print('Please enter y or n.')
 
-def create_playlist(username, playlist_name, public=False):
+def create_playlist(username: str, playlist_name: str, public: bool = False, sp: Optional[spotipy.Spotify] = None) -> Optional[str]:
     """Create a playlist for a user."""
-    sp = get_spotify_client(username=username)
+    if not sp:
+        sp = get_spotify_client(username=username)
     if sp:
         try:
             playlist = _spotify_call(lambda: sp.user_playlist_create(username, playlist_name, public=public))
@@ -133,20 +146,20 @@ def create_playlist(username, playlist_name, public=False):
             return None
     return None
 
-def change_playlist_name(username, playlist_id, new_name):
+def change_playlist_name(username: str, playlist_id: str, new_name: str) -> None:
     """Changes a playlist's name."""
     sp = get_spotify_client(username=username)
     if sp:
         _spotify_call(lambda: sp.user_playlist_change_details(username, playlist_id, name=new_name))
 
-def show_all_playlists(username):
+def show_all_playlists(username: str) -> Optional[Dict[str, Any]]:
     """Returns all playlists for a user."""
     sp = get_spotify_client(username=username)
     if sp:
         return _spotify_call(lambda: sp.user_playlists(username))
     return None
 
-def find_playlist_by_name(username, playlist_name):
+def find_playlist_by_name(username: str, playlist_name: str) -> Optional[str]:
     """Finds a playlist ID by exact name match for a user."""
     sp = get_spotify_client(username=username)
     if not sp:
@@ -203,8 +216,8 @@ def get_playlist_track_signatures(username, playlist_id):
                 name = track['name'].lower().strip()
                 # Use first artist for signature
                 artist = track['artists'][0]['name'].lower().strip() if track['artists'] else ""
-                # Round duration to nearest second (1000ms) to account for minor variations
-                duration = round(track['duration_ms'] / 1000)
+                # Round duration to nearest second (DURATION_BUCKET_SIZE_MS) to account for minor variations
+                duration = round(track['duration_ms'] / DURATION_BUCKET_SIZE_MS)
                 
                 signatures.add((name, artist, duration))
         
@@ -215,25 +228,26 @@ def get_playlist_track_signatures(username, playlist_id):
             
     return signatures
 
-def create_track_signature(track):
+def create_track_signature(track: Dict[str, Any]) -> Tuple[str, str, int]:
     """Creates a signature tuple for a track object."""
     if advanced_signature:
         return advanced_signature(track)
         
     name = track['name'].lower().strip()
     artist = track['artists'][0]['name'].lower().strip() if track['artists'] else ""
-    duration = round(track['duration_ms'] / 1000)
+    duration = round(track['duration_ms'] / DURATION_BUCKET_SIZE_MS)
     return (name, artist, duration)
 
-def add_song_to_spotify_playlist(username, track_ids, playlist_id):
+def add_song_to_spotify_playlist(username: str, track_ids: List[str], playlist_id: str, sp: Optional[spotipy.Spotify] = None) -> None:
     """Adds songs to a playlist in Spotify."""
-    sp = get_spotify_client(username=username)
+    if not sp:
+        sp = get_spotify_client(username=username)
     if not sp:
         return
 
-    # Spotify API limit is 100 tracks per request
-    for i in range(0, len(track_ids), 100):
-        chunk = track_ids[i:i + 100]
+    # Spotify API limit is SPOTIFY_PLAYLIST_ADD_BATCH_SIZE tracks per request
+    for i in range(0, len(track_ids), SPOTIFY_PLAYLIST_ADD_BATCH_SIZE):
+        chunk = track_ids[i:i + SPOTIFY_PLAYLIST_ADD_BATCH_SIZE]
         try:
             sp.user_playlist_add_tracks(username, playlist_id, chunk)
         except Exception as e:
@@ -280,10 +294,10 @@ def get_album_info(sp, album_spotify_ids):
     """Returns all data about albums."""
     all_results = []
     
-    # Spotify allows fetching multiple albums (up to 20)
-    # We should chunk if album_spotify_ids > 20
-    for i in range(0, len(album_spotify_ids), 20):
-        chunk = album_spotify_ids[i:i+20]
+    # Spotify allows fetching multiple albums (up to SPOTIFY_ALBUM_FETCH_BATCH_SIZE)
+    # We should chunk if album_spotify_ids > SPOTIFY_ALBUM_FETCH_BATCH_SIZE
+    for i in range(0, len(album_spotify_ids), SPOTIFY_ALBUM_FETCH_BATCH_SIZE):
+        chunk = album_spotify_ids[i:i+SPOTIFY_ALBUM_FETCH_BATCH_SIZE]
         albums_resp = _spotify_call(lambda: sp.albums(chunk))
         if not albums_resp:
             continue

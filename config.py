@@ -16,11 +16,18 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+# Import LOG_LEVEL from constants (can be overridden by config.yaml)
+try:
+    from constants import LOG_LEVEL
+    log_level = LOG_LEVEL
+except ImportError:
+    log_level = settings.log_level
+
 # Configure Logging
 try:
     from rich.logging import RichHandler
     logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(rich_tracebacks=True, markup=True)]
@@ -28,7 +35,7 @@ try:
 except ImportError:
     # Fallback if rich is not installed
     logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)]
     )

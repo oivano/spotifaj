@@ -1,0 +1,75 @@
+# Spotifaj Configuration File
+# Override default constants at runtime by modifying values here
+
+# Confidence Thresholds (percentage 0-100)
+confidence:
+  auto_accept: 70  # Minimum confidence to auto-accept track matches
+  high: 90  # High confidence score for perfect matches
+  medium: 60  # Medium confidence score
+  low: 30  # Low confidence score
+  playlist_discovery: 45  # Threshold for playlist matching
+  label_search: 50  # Confidence for broad label searches
+  artist_intent: 0.8  # Artist intent detection threshold (0.0-1.0)
+  album_intent: 0.9  # Album intent detection threshold (0.0-1.0)
+
+# API Rate Limiting
+rate_limiting:
+  discogs:
+    per_minute: 25  # Conservative rate (vs 60/min limit = 58% buffer)
+    max_retries: 5  # Maximum retry attempts
+    retry_after_buffer: 1.0  # Additional seconds after Retry-After header
+  
+  spotify:
+    min_request_interval: 0.5  # Minimum seconds between requests (2 req/sec)
+    burst_limit: 25  # Maximum burst requests before cooldown
+    burst_cooldown: 1.0  # Cooldown period after burst (seconds)
+    retry_backoff_base: 1.5  # Base for exponential backoff
+    max_retries: 3  # Maximum retry attempts
+    request_timeout: 20  # Timeout for requests (seconds)
+    default_delay: 0.2  # Default delay between API calls (seconds)
+
+# Batch Sizes
+batch_sizes:
+  spotify_playlist_add: 100  # Spotify API limit for adding tracks
+  spotify_album_fetch: 20  # Spotify API limit for fetching albums
+  spotify_search_default: 50  # Default search result limit
+  spotify_search_max: 1000  # Maximum search results before year-based search
+  discogs_search_pages: 40  # Maximum pages for label search
+  track_deduplicator: 50  # Batch size for track verification
+  release_processing: 10  # Batch size for Discogs release processing
+
+# Display and UI
+display:
+  default_limit: 20  # Default number of tracks to display
+  indent_width: 2  # Width for numbered list indentation
+  max_playlist_width: 45  # Width for playlist name in progress bars
+
+# Cache Settings
+cache:
+  expiry_days: 7  # Default cache expiration (days)
+  version: "2.0"  # Cache format version
+  type: "sqlite"  # Cache backend: "json" or "sqlite"
+  sqlite_path: ".cache/spotifaj.db"  # Path to SQLite database
+
+# Search and Matching
+search:
+  year_start: 1950  # Starting year for exhaustive search
+  year_end: 2026  # Ending year for exhaustive search
+  duration_bucket_ms: 1000  # Round duration to nearest second for matching
+  max_playlists_discovery: 10  # Maximum playlists to discover per label
+
+# Error Recovery
+error_recovery:
+  batch_min_time: 1.0  # Minimum time for batch processing (seconds)
+  batch_cooldown: 0.5  # Cooldown between batches (seconds)
+
+# General Settings
+general:
+  country_code: "US"  # Default country for market-specific searches
+  log_level: "INFO"  # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# Performance Profiling
+profiling:
+  enabled: false  # Enable performance profiling
+  output_file: "performance.log"  # Output file for profiling data
+  track_hot_paths: true  # Track frequently called functions

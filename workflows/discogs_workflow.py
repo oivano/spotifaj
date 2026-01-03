@@ -15,6 +15,21 @@ from clients.discogs_client import get_discogs_client
 from utils.cache_manager import CacheManager
 from utils.track_verifier import TrackVerifier
 from utils.track_deduplicator import deduplicate_tracks
+from constants import (
+    SPOTIFY_MIN_REQUEST_INTERVAL,
+    SPOTIFY_BURST_LIMIT,
+    SPOTIFY_BURST_COOLDOWN,
+    CONFIDENCE_HIGH,
+    CONFIDENCE_MEDIUM,
+    CONFIDENCE_LOW,
+    CONFIDENCE_LABEL_SEARCH,
+    CONFIDENCE_PLAYLIST_DISCOVERY,
+    MAX_PLAYLISTS_FOR_DISCOVERY,
+    RELEASE_PROCESSING_BATCH_SIZE,
+    DISCOGS_SEARCH_PAGE_LIMIT,
+    BATCH_PROCESSING_MIN_TIME,
+    BATCH_COOLDOWN_BETWEEN,
+)
 
 logger = logging.getLogger('discogs_workflow')
 
@@ -41,11 +56,11 @@ class DiscogsLabelWorkflow:
         
         # Add Spotify-specific rate limiting
         self.spotify_last_request_time = 0
-        self.spotify_min_request_interval = 0.5  # 2 requests per second to be safe
+        self.spotify_min_request_interval = SPOTIFY_MIN_REQUEST_INTERVAL  # 2 requests per second to be safe
         self.spotify_burst_count = 0
-        self.spotify_burst_limit = 25
+        self.spotify_burst_limit = SPOTIFY_BURST_LIMIT
         self.spotify_burst_reset_time = 0
-        self.spotify_burst_cooldown = 1.0  # 1 second cooldown after hitting burst limit
+        self.spotify_burst_cooldown = SPOTIFY_BURST_COOLDOWN  # 1 second cooldown after hitting burst limit
         
         # Store user ID for later use
         try:
@@ -105,14 +120,14 @@ class DiscogsLabelWorkflow:
         
         if results and results['tracks']['items']:
             # Found tracks with the efficient query, no need for others
-            confidence_base = 90
+            confidence_base = CONFIDENCE_HIGH
             track_data = [(track['id'], confidence_base) for track in results['tracks']['items'] 
                          if track and 'id' in track]
             all_tracks.extend(track_data)
         else:
             # Fall back to other strategies with reduced confidence
             for i, query in enumerate(strategies[1:], 1):
-                confidence_base = 90 - (i * 20)
+                confidence_base = CONFIDENCE_HIGH - (i * 20)
                 
                 results = self._try_spotify_search(query, max_retries)
                 
@@ -192,7 +207,7 @@ class DiscogsLabelWorkflow:
         processed = 0
         
         # Optimize batch size for Spotify - larger batches are more efficient
-        batch_size = 10  # Spotify can handle larger batches
+        batch_size = RELEASE_PROCESSING_BATCH_SIZE  # Spotify can handle larger batches
         
         logger.info(f"Starting search for {total_releases} releases...")
 
@@ -216,10 +231,12 @@ class DiscogsLabelWorkflow:
             # Extend results all at once (more efficient)
             results.extend(batch_results)
             
-            # Add a small delay between batches to avoid Spotify throttling
-            batch_processing_time = time.time() - batch_start_time
-            if batch_processing_time < 1.0 and i + batch_size < total_releases:
-                time.sleep(0.5)  # Small cooldown between batches
+        # Only cache if batch completed successfully
+        batch_time = time.time() - batch_start_time
+        
+        # Add inter-batch cooldown if processing next batch
+        if i + batch_size < total_releases and batch_time < BATCH_PROCESSING_MIN_TIME:
+            time.sleep(BATCH_COOLDOWN_BETWEEN)
         
         return results
     
@@ -234,14 +251,14 @@ class DiscogsLabelWorkflow:
             results = self.sp.search(f'label:"{label_name}"', type='track', limit=50)
             page_count = 0
             
-            while results and page_count < 40:  # Limit pages to prevent excessive API calls
+            while results and page_count < DISCOGS_SEARCH_PAGE_LIMIT:  # Limit pages to prevent excessive API calls
                 items = results['tracks']['items']
                 if not items:
                     break
                     
                 for item in items:
                     if item and 'id' in item:
-                        low_confidence_track_data.append((item['id'], 50))  # Medium confidence for label search
+                        low_confidence_track_data.append((item['id'], CONFIDENCE_LABEL_SEARCH))  # Medium confidence for label search
                         
                 if results['tracks']['next']:
                     self._spotify_wait_for_rate_limit()
@@ -301,7 +318,7 @@ class DiscogsLabelWorkflow:
             playlist_track_data = []
             try:
                 # Fix: Change 'search_type' to 'type'
-                playlist_results = self.sp.search(f'"{label.name}"', type='playlist', limit=10)
+                playlist_results = self.sp.search(f'"{label.name}"', type='playlist', limit=MAX_PLAYLISTS_FOR_DISCOVERY)
                 playlists = playlist_results['playlists']['items'] if 'playlists' in playlist_results else []
                 
                 if playlists:
@@ -366,7 +383,7 @@ class DiscogsLabelWorkflow:
                                     
                                 track = item['track']
                                 if track and 'id' in track:
-                                    playlist_track_data.append((track['id'], 45))  # Medium confidence
+                                    playlist_track_data.append((track['id'], CONFIDENCE_PLAYLIST_DISCOVERY))  # Medium confidence
                                     playlist_found_count += 1
                                 
                             total_found += playlist_found_count
