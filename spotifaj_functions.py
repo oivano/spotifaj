@@ -114,6 +114,8 @@ def confirm(prompt: Optional[str] = None, default: bool = False) -> bool:
     """
     Prompts for yes or no response from the user.
     Returns True for yes and False for no.
+    
+    If stdin is closed (e.g., after Ctrl+D), returns the default value.
     """
     if prompt is None:
         prompt = 'Create NEW playlist and add found tracks to it?'
@@ -124,14 +126,18 @@ def confirm(prompt: Optional[str] = None, default: bool = False) -> bool:
         prompt = '%s [%s]|%s: ' % (prompt, 'N', 'y')
 
     while True:
-        ans = input(prompt).strip().lower()
-        if not ans:
+        try:
+            ans = input(prompt).strip().lower()
+            if not ans:
+                return default
+            if ans in ['y', 'yes']:
+                return True
+            if ans in ['n', 'no']:
+                return False
+            print('Please enter y or n.')
+        except (EOFError, OSError):
+            # stdin is closed or unavailable, use default
             return default
-        if ans in ['y', 'yes']:
-            return True
-        if ans in ['n', 'no']:
-            return False
-        print('Please enter y or n.')
 
 def create_playlist(username: str, playlist_name: str, public: bool = False, sp: Optional[spotipy.Spotify] = None) -> Optional[str]:
     """Create a playlist for a user."""
@@ -484,7 +490,8 @@ def search_tracks_exhaustive(sp, label, market='US'):
     """
     Searches for tracks by label, iterating through years to bypass the 1000-item search limit.
     """
-    logger.info(f"Searching for tracks by label: '{label}' (Exhaustive Search)...")
+    # Use %s formatting to avoid issues with special characters like $ in label names
+    logger.info("Searching for tracks by label: '%s' (Exhaustive Search)...", label)
     
     all_tracks = []
     seen_ids = set()
@@ -530,7 +537,7 @@ def _build_label_map(sp, album_to_tracks):
 
     return label_map
 
-def validate_tracks_list(sp, tracks, target_label, selection=None):
+def validate_tracks_list(sp, tracks, target_label, selection=None, auto_mode=False):
     """
     Validates a list of track objects against a target label.
     Returns a list of track IDs to KEEP.
@@ -541,6 +548,8 @@ def validate_tracks_list(sp, tracks, target_label, selection=None):
     - 'suggested': exclude suggested mismatches
     - list/tuple/set of indices (1-based) to exclude
     - ('keep', [indices]) to keep only specified labels
+    
+    auto_mode: if True, automatically excludes all non-strict matches (quality < 2)
     """
     logger.info(f"Validating {len(tracks)} tracks against label '{target_label}'...")
 
@@ -570,10 +579,21 @@ def validate_tracks_list(sp, tracks, target_label, selection=None):
 
     # Helper to determine match quality
     def get_match_quality(lbl, target):
-        n_lbl = (lbl or "").lower().strip()
-        n_target = target.lower().strip()
+        import re
         
-        if n_lbl == n_target: return 2 # Exact
+        # Normalize: lowercase, strip, remove common punctuation
+        def normalize(s):
+            s = s.lower().strip()
+            # Remove apostrophes, quotes, periods, commas
+            s = re.sub(r"['\".,-]", "", s)
+            # Collapse multiple spaces to single space
+            s = re.sub(r'\s+', ' ', s)
+            return s
+        
+        n_lbl = normalize(lbl or "")
+        n_target = normalize(target)
+        
+        if n_lbl == n_target: return 2 # Exact (after normalization)
         if n_lbl.startswith(n_target + " ") or n_lbl.startswith(n_target + "/") or n_lbl.startswith(n_target + "-"): return 2 # Strict Prefix
         if n_target in n_lbl: return 1 # Loose Substring
         return 0 # No match
@@ -585,6 +605,20 @@ def validate_tracks_list(sp, tracks, target_label, selection=None):
             suggested_indices.append(str(i + 1))
 
     indices_to_exclude = []
+    
+    # Auto mode: exclude all non-strict matches (quality < 2) silently
+    if auto_mode:
+        indices_to_exclude = [i for i, quality in enumerate(label_quality) if quality < 2]
+        if indices_to_exclude:
+            excluded_count = sum(len(sorted_labels[i][1]) for i in indices_to_exclude)
+            logger.info(f"Auto-validation: excluding {len(indices_to_exclude)} non-matching labels ({excluded_count} tracks)")
+        
+        # Jump to the return statement
+        tracks_to_keep = []
+        for i, (label, lbl_tracks) in enumerate(sorted_labels):
+            if i not in indices_to_exclude:
+                tracks_to_keep.extend([t['id'] for t in lbl_tracks])
+        return tracks_to_keep
 
     def _collect_selection():
         if selection is None:
@@ -661,7 +695,10 @@ def validate_tracks_list(sp, tracks, target_label, selection=None):
             logger.error("Invalid input. Operation cancelled.")
             return None
 
-    elif choice in ('none', ''):
+    elif choice == 'none':
+        logger.info("Excluding all tracks.")
+        return []
+    elif choice == '':
         logger.info("Keeping all tracks.")
         return [t['id'] for t in tracks]
     elif choice == 'suggested':
@@ -727,6 +764,7 @@ def find_duplicates_in_playlist(username, playlist_id):
     # We need to handle pagination manually to process all tracks
     results = sp.user_playlist_tracks(username, playlist_id)
     position = 0
+    page_count = 0
     
     while results:
         for item in results['items']:
@@ -751,7 +789,22 @@ def find_duplicates_in_playlist(username, playlist_id):
             position += 1
         
         if results['next']:
-            results = sp.next(results)
+            page_count += 1
+            # Add delay between pagination requests to avoid rate limiting
+            # Increase delay every 10 pages to be extra cautious
+            if page_count % 10 == 0:
+                time.sleep(0.5)
+            else:
+                time.sleep(0.1)
+            
+            try:
+                results = sp.next(results)
+            except Exception as e:
+                # If we hit rate limit, log and return what we have
+                if '429' in str(e):
+                    logger.warning(f"Rate limit hit while scanning playlist. Processed {position} tracks.")
+                    return duplicates
+                raise
         else:
             results = None
             

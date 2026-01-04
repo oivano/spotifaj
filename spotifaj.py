@@ -87,7 +87,7 @@ def search_label(label, username, playlist, exhaustive, year, validate):
                 start_year = int(start_str)
                 end_year = int(end_str)
                 
-                logger.info(f"Searching for label: '{label}' in range {start_year}-{end_year}...")
+                logger.info("Searching for label: '%s' in range %d-%d...", label, start_year, end_year)
                 found_tracks = []
                 seen_ids = set()
                 
@@ -105,7 +105,7 @@ def search_label(label, username, playlist, exhaustive, year, validate):
         else:
             try:
                 year_int = int(year)
-                logger.info(f"Searching for label: '{label}' in year {year_int}...")
+                logger.info("Searching for label: '%s' in year %d...", label, year_int)
                 found_tracks = spotifaj_functions.search_tracks_by_year(sp, label, year_int)
             except ValueError:
                 logger.error(f"Invalid year: {year}. Use a 4-digit year, range YYYY-YYYY, or 'all'.")
@@ -113,7 +113,7 @@ def search_label(label, username, playlist, exhaustive, year, validate):
     elif exhaustive:
         found_tracks = spotifaj_functions.search_tracks_exhaustive(sp, label)
     else:
-        logger.info(f"Searching for label: '{label}' (Standard Search)...")
+        logger.info("Searching for label: '%s' (Standard Search)...", label)
         query = f"label:\"{label}\""
         found_tracks = []
         try:
@@ -211,6 +211,16 @@ def search_label(label, username, playlist, exhaustive, year, validate):
                 logger.info(f"Adding {len(track_ids)} tracks to playlist (ID: {target_playlist_id})...")
                 spotifaj_functions.add_song_to_spotify_playlist(username, track_ids, target_playlist_id)
                 logger.info("Done!")
+                
+                # Offer to add cover image (only for new playlists)
+                if not is_existing:
+                    if spotifaj_functions.confirm("\nWould you like to add a cover image?", default=False):
+                        image_url = click.prompt("Enter image URL (JPEG)", type=str)
+                        try:
+                            upload_playlist_cover(sp, target_playlist_id, image_url)
+                            console.print("[green]Cover image uploaded successfully![/green]")
+                        except Exception as e:
+                            console.print(f"[red]Failed to upload cover image: {e}[/red]")
             else:
                 logger.info("No tracks left after validation.")
         else:
@@ -705,9 +715,10 @@ def deduplicate(playlist_input, username, check_all, dry_run, keep_best):
     ) as progress:
         task = progress.add_task("...", total=total_playlists)
 
-        for pl in playlists_to_check:
-            # Be polite to the API
-            time.sleep(SPOTIFY_DEFAULT_DELAY)
+        for pl_index, pl in enumerate(playlists_to_check):
+            # Be polite to the API - increase delay to avoid rate limiting
+            # Use longer delay when processing many playlists
+            time.sleep(0.5 if total_playlists > 50 else SPOTIFY_DEFAULT_DELAY)
             
             name = pl['name']
             pid = pl['id']
@@ -719,7 +730,17 @@ def deduplicate(playlist_input, username, check_all, dry_run, keep_best):
             
             progress.update(task, description=f"[cyan]'{name}'...[/cyan]")
             
-            duplicates = spotifaj_functions.find_duplicates_in_playlist(username, pid)
+            try:
+                duplicates = spotifaj_functions.find_duplicates_in_playlist(username, pid)
+            except Exception as e:
+                if '429' in str(e):
+                    console.print(f"\n[yellow]⚠ Rate limit reached. Processed {pl_index + 1}/{total_playlists} playlists.[/yellow]")
+                    console.print(f"[yellow]Please wait before running again, or process fewer playlists at a time.[/yellow]")
+                    break
+                else:
+                    console.print(f"\n[red]Error processing '{name}': {e}[/red]")
+                    progress.advance(task)
+                    continue
             
             if duplicates and keep_best:
                 # Apply keep-best logic to determine which versions to keep
@@ -888,15 +909,26 @@ def deduplicate(playlist_input, username, check_all, dry_run, keep_best):
 @spotifaj.command()
 @click.argument('playlist_input')
 @click.option('--username', default=settings.spotipy_username, help="Spotify username.")
-@click.option('--format', '-f', type=click.Choice(['txt', 'csv', 'json', 'm3u']), default='txt', help="Export format.")
-@click.option('--output', '-o', type=click.Path(), help="Output file path. If not specified, prints to stdout.")
-def export_playlist(playlist_input, username, format, output):
+@click.option('-f', '--format', type=click.Choice(['txt', 'csv', 'json', 'm3u']), help="Export format (auto-detected from file extension if not specified).")
+@click.option('--file', type=click.Path(), help="Output file path. If not specified, prints to stdout.")
+def export_playlist(playlist_input, username, format, file):
     """
     Export a playlist in various formats.
     
     PLAYLIST_INPUT can be a Spotify Playlist URL, ID, or Name.
     Formats: txt (Artist - Track), csv (full metadata), json, m3u (playlist file)
     """
+    # Auto-detect format from file extension if not specified
+    if not format:
+        if file:
+            ext = file.lower().rsplit('.', 1)[-1] if '.' in file else None
+            if ext in ['txt', 'csv', 'json', 'm3u']:
+                format = ext
+            else:
+                format = 'txt'  # Default fallback
+        else:
+            format = 'txt'  # Default for stdout
+    
     sp = spotifaj_functions.get_spotify_client(username=username)
     if not sp:
         logger.error("Failed to initialize Spotify client.")
@@ -953,6 +985,9 @@ def export_playlist(playlist_input, username, format, output):
                 track = item['track']
                 artists = ", ".join([a['name'] for a in track['artists']])
                 lines.append(f"{artists} - {track['name']}")
+                # Include URI as comment only when exporting to file (for reliable re-import)
+                if file:
+                    lines.append(f"# {track['uri']}")
             output_content = "\n".join(lines)
             
         elif format == 'csv':
@@ -1011,10 +1046,10 @@ def export_playlist(playlist_input, username, format, output):
             output_content = "\n".join(lines)
         
         # Output to file or stdout
-        if output:
-            with open(output, 'w', encoding='utf-8') as f:
+        if file:
+            with open(file, 'w', encoding='utf-8') as f:
                 f.write(output_content)
-            console.print(f"[green]Exported {len(valid_tracks)} tracks to {output}[/green]")
+            console.print(f"[green]Exported {len(valid_tracks)} tracks to {file}[/green]")
         else:
             print(output_content)
             
@@ -1166,6 +1201,9 @@ def parse_track_input(line):
     Returns:
         tuple: (artist, track_name, all_artists) where all_artists is the full artist string
     """
+    # Strip numbered prefixes like "01. ", "1. ", etc.
+    line = re.sub(r'^\s*\d+\.\s*', '', line)
+    
     # Don't normalize yet - we need separators to parse!
     # Just clean up the pipe content first
     if '|' in line:
@@ -1311,30 +1349,50 @@ def calculate_match_confidence(search_result, expected_artist, expected_track, e
         # 2. Also check if any words from expected_all_artists appear in actual artists
         if expected_all_artists:
             # Extract artist names from the full string
-            expected_names = re.split(r'\s+(?:featuring|feat\.?|ft\.?|with|&|,)\s+', expected_all_artists, flags=re.IGNORECASE)
+            # Split on featuring/feat/ft/with/& and also on commas (with optional spaces)
+            expected_names = re.split(r'\s+(?:featuring|feat\.?|ft\.?|with|&)\s+|\s*,\s*', expected_all_artists, flags=re.IGNORECASE)
             for expected_name in expected_names:
                 expected_name_norm = normalize_text_for_matching(expected_name.strip()).lower()
                 for actual_artist in actual_artists:
                     actual_artist_norm = normalize_text_for_matching(actual_artist).lower()
                     score = SequenceMatcher(None, expected_name_norm, actual_artist_norm).ratio()
                     artist_scores.append(score)
+            
+            # Bonus: If we have multiple expected artists, check if actual track also has multiple
+            # and if the artist count is similar (indicates multi-artist collaboration match)
+            multi_artist_boost_applied = False
+            if len(expected_names) > 1 and len(actual_artists) >= len(expected_names):
+                # Count how many expected artists have good matches (>= 0.8 similarity)
+                good_matches = sum(1 for score in artist_scores if score >= 0.8)
+                match_ratio = good_matches / len(expected_names)
+                
+                # If most/all artists match well, boost confidence significantly
+                if match_ratio >= 0.75:
+                    # This is likely a multi-artist exact match
+                    confidence = min(100, confidence + 20)
+                    multi_artist_boost_applied = True
+        else:
+            multi_artist_boost_applied = False
         
         # Use best artist match
         if artist_scores:
             best_artist_match = max(artist_scores)
             confidence += int(best_artist_match * 50)
             
-            # Strict penalty if artist match is poor
-            # Even "similar" artist names like Anushka vs Anouk should be penalized
-            if best_artist_match < 0.3:
-                # Extremely poor match - basically reject it
-                confidence = int(confidence * 0.2)  # Reduce by 80%
-            elif best_artist_match < 0.5:
-                # Poor match
-                confidence = int(confidence * 0.4)  # Reduce by 60%
-            elif best_artist_match < 0.75:
-                # Moderate match - similar but not exact (Anushka vs Anouk)
-                confidence = int(confidence * 0.6)  # Reduce by 40%
+            # Only apply strict penalties if this is NOT a multi-artist match
+            # (multi-artist matches already verified all artists individually)
+            if not multi_artist_boost_applied:
+                # Strict penalty if artist match is poor
+                # Even "similar" artist names like Anushka vs Anouk should be penalized
+                if best_artist_match < 0.3:
+                    # Extremely poor match - basically reject it
+                    confidence = int(confidence * 0.2)  # Reduce by 80%
+                elif best_artist_match < 0.5:
+                    # Poor match
+                    confidence = int(confidence * 0.4)  # Reduce by 60%
+                elif best_artist_match < 0.75:
+                    # Moderate match - similar but not exact (Anushka vs Anouk)
+                    confidence = int(confidence * 0.6)  # Reduce by 40%
     else:
         # No artist specified, only use track matching (less reliable)
         confidence = int(confidence * 0.7)  # Reduce confidence when no artist
@@ -1342,19 +1400,67 @@ def calculate_match_confidence(search_result, expected_artist, expected_track, e
     return min(confidence, 100)
 
 
+def fetch_1001tracklists(url):
+    """
+    Fetch tracklist from 1001tracklists.com URL.
+    
+    Args:
+        url: 1001tracklists.com URL
+        
+    Returns:
+        list: List of track strings in "Artist - Track" format
+    """
+    logger.info(f"Fetching tracklist from {url}...")
+    
+    # Extract tracklist ID from URL
+    match = re.search(r'/tracklist/([a-zA-Z0-9]+)/', url)
+    if not match:
+        logger.error("Could not extract tracklist ID from URL")
+        return None
+    
+    tracklist_id = match.group(1)
+    
+    # The 1001tracklists export API requires authentication
+    logger.error("1001tracklists.com requires authentication for programmatic access.")
+    logger.error("Please export the tracklist manually:")
+    console.print("\n[yellow]Manual Export Instructions:[/yellow]")
+    console.print("1. Open the tracklist in your browser")
+    console.print("2. Look for the 'Export' or 'Download' button on the page")
+    console.print("3. Export as Text format")
+    console.print("4. Save to a file (e.g., tracklist.txt)")
+    console.print("5. Import with: [cyan]./spotifaj import-playlist tracklist.txt -n \"Playlist Name\"[/cyan]")
+    console.print("\nOr copy tracks directly from the page and paste when prompted:\n")
+    console.print("   [cyan]./spotifaj import-playlist -n \"Playlist Name\"[/cyan]")
+    console.print("   [dim](then paste tracks and press Ctrl+D)[/dim]\n")
+    
+    return None
+
+
 @spotifaj.command()
 @click.argument('input_file', type=click.File('r'), required=False)
 @click.option('--name', '-n', required=True, help="Name of the new playlist.")
 @click.option('--username', default=settings.spotipy_username, help="Spotify username.")
-def import_playlist(input_file, name, username):
+@click.option('--yes', '-y', is_flag=True, help="Skip confirmation prompts.")
+@click.option('--url', help="Import from a 1001tracklists.com URL.")
+def import_playlist(input_file, name, username, yes, url):
     """
-    Create a playlist from a text list of tracks.
+    Create a playlist from a text list of tracks or a 1001tracklists URL.
     
-    Reads from INPUT_FILE or stdin if not provided.
+    Reads from INPUT_FILE, stdin, or --url if provided.
     Expected format: "Artist - Track Name" per line.
     """
     # Handle input source
-    if input_file:
+    if url:
+        # Check if it's a 1001tracklists URL
+        if '1001tracklists.com' in url:
+            lines = fetch_1001tracklists(url)
+            if not lines:
+                logger.error("Failed to fetch tracklist from URL.")
+                return
+        else:
+            logger.error("URL must be from 1001tracklists.com")
+            return
+    elif input_file:
         lines = input_file.readlines()
     else:
         # Check if data is being piped
@@ -1369,7 +1475,7 @@ def import_playlist(input_file, name, username):
         logger.warning("No input provided.")
         return
 
-    sp = spotifaj_functions.get_spotify_client(username=username, scope="playlist-modify-public playlist-modify-private ugc-image-upload")
+    sp = spotifaj_functions.get_spotify_client(username=username)
     if not sp:
         logger.error("Failed to initialize Spotify client.")
         sys.exit(1)
@@ -1388,15 +1494,58 @@ def import_playlist(input_file, name, username):
     ) as progress:
         task = progress.add_task("Searching tracks...", total=len(lines))
         
-        for line_num, line in enumerate(lines):
-            line = line.strip()
+        line_num = 0
+        while line_num < len(lines):
+            line = lines[line_num].strip()
+            
             if not line:
                 progress.advance(task)
+                line_num += 1
                 continue
             
             # Skip log lines if piping from export command
             if (line.startswith("[") and "INFO" in line) or line.startswith("Exporting playlist"):
                 progress.advance(task)
+                line_num += 1
+                continue
+            
+            # Check if this is a direct URI input (without comment prefix)
+            if line.startswith("spotify:track:"):
+                uri = line.strip()
+                track_uris.append({
+                    'uri': uri,
+                    'input': uri,
+                    'found': f'{uri} (direct URI)',
+                    'confidence': 100,
+                    'line_num': line_num
+                })
+                progress.advance(task)
+                line_num += 1
+                continue
+            
+            # Skip URI comment lines - they should have been processed with their track line
+            if line.startswith("# spotify:track:"):
+                progress.advance(task)
+                line_num += 1
+                continue
+            
+            # Check if next line is a URI comment (from our TXT export)
+            has_uri_next = (line_num + 1 < len(lines) and 
+                           lines[line_num + 1].strip().startswith("# spotify:track:"))
+            
+            if has_uri_next:
+                # Use the URI directly without searching
+                uri = lines[line_num + 1].strip()[2:].strip()  # Remove "# " prefix
+                track_uris.append({
+                    'uri': uri,
+                    'input': line,
+                    'found': f'{line} (from URI)',
+                    'confidence': 100,
+                    'line_num': line_num
+                })
+                progress.advance(task)
+                progress.advance(task)  # Skip the URI line too
+                line_num += 2  # Skip both lines
                 continue
 
             try:
@@ -1492,6 +1641,7 @@ def import_playlist(input_file, name, username):
                 not_found.append(line)
             
             progress.advance(task)
+            line_num += 1
 
     # Report results
     console.print(f"\n[bold]Found {len(track_uris)} high-confidence matches.[/bold]")
@@ -1502,7 +1652,7 @@ def import_playlist(input_file, name, username):
         for match in low_confidence_matches:
             console.print(f"  Input: [cyan]{match['input']}[/cyan]")
             console.print(f"  Found: [magenta]{match['found']}[/magenta] (confidence: {match['confidence']}%)")
-            if spotifaj_functions.confirm("  Include this track?", default=False):
+            if yes or spotifaj_functions.confirm("  Include this track?", default=False):
                 track_uris.append(match)
             console.print()
     
@@ -1524,7 +1674,7 @@ def import_playlist(input_file, name, username):
         return
 
     # Create playlist
-    if spotifaj_functions.confirm(f"Create playlist '{name}' with {len(final_track_uris)} tracks?", default=True):
+    if yes or spotifaj_functions.confirm(f"Create playlist '{name}' with {len(final_track_uris)} tracks?", default=True):
         playlist_id = spotifaj_functions.create_playlist(username, name, sp=sp)
         if playlist_id:
             spotifaj_functions.add_song_to_spotify_playlist(username, final_track_uris, playlist_id, sp=sp)
@@ -1733,7 +1883,16 @@ def auto_update(playlists, username, batch, playlist_file, dry_run):
     if playlist_file:
         try:
             with open(playlist_file, 'r') as f:
-                file_playlists = [line.strip() for line in f if line.strip()]
+                file_playlists = []
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Handle tab-separated format (from export-playlist-names --verbose)
+                    # Take only the first column (playlist name)
+                    playlist_name = line.split('\t')[0].strip()
+                    if playlist_name:
+                        file_playlists.append(playlist_name)
                 playlist_list.extend(file_playlists)
         except Exception as e:
             console.print(f"[red]Error reading file '{playlist_file}': {e}[/red]")
@@ -1748,25 +1907,53 @@ def auto_update(playlists, username, batch, playlist_file, dry_run):
             return
         
         console.print(f"[bold cyan]Batch updating {len(playlist_list)} playlists...[/bold cyan]")
+        console.print(f"[dim]Fetching all playlists...[/dim]")
+        
+        # Fetch all playlists once to avoid rate limiting
+        all_playlists = spotifaj_functions.fetch_all_user_playlists(username)
+        playlist_name_to_id = {p['name']: p['id'] for p in all_playlists}
+        
+        console.print(f"[dim]Checking {len(playlist_list)} playlists against tracker...[/dim]")
         
         # Get tracker metadata for all playlists
         tracked_playlists = tracker.get_all_tracked()
         
         # Build list of playlists to update with their metadata
         playlists_to_update = []
+        # Track skipped playlists for summary
+        not_found = []
+        not_tracked = []
+        recently_updated = []  # Updated within last 24 hours
+        
+        # Get current time for 24-hour check
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        cutoff_time = now - timedelta(hours=24)
+        
         for playlist_name in playlist_list:
-            # Find playlist ID
-            playlist_id = spotifaj_functions.find_playlist_by_name(username, playlist_name)
+            # Look up playlist ID in memory (no API call)
+            playlist_id = playlist_name_to_id.get(playlist_name)
             
             if not playlist_id:
-                console.print(f"[yellow]⚠ Playlist '{playlist_name}' not found. Skipping.[/yellow]")
+                not_found.append(playlist_name)
                 continue
             
             # Check if tracked and has label metadata
             if playlist_id not in tracked_playlists:
-                console.print(f"[yellow]⚠ Playlist '{playlist_name}' is not tracked. Skipping.[/yellow]")
-                console.print(f"[dim]  Hint: Run 'spotifaj auto-update \"{playlist_name}\"' first to initialize tracking.[/dim]")
+                not_tracked.append(playlist_name)
                 continue
+            
+            # Check if updated within last 24 hours
+            last_update_str = tracker.get_last_update(playlist_id)
+            if last_update_str:
+                try:
+                    last_update = datetime.fromisoformat(last_update_str)
+                    if last_update > cutoff_time:
+                        recently_updated.append(playlist_name)
+                        continue
+                except (ValueError, TypeError):
+                    # Invalid timestamp, continue with update
+                    pass
             
             metadata = tracked_playlists[playlist_id].get('metadata', {})
             stored_label = metadata.get('label')
@@ -1781,6 +1968,20 @@ def auto_update(playlists, username, batch, playlist_file, dry_run):
                 'label': stored_label
             })
         
+        # Show summary of skipped playlists
+        if recently_updated:
+            console.print(f"\n[dim]⏭ {len(recently_updated)} playlist(s) updated within last 24 hours (skipping):[/dim]")
+            for name in recently_updated:
+                console.print(f"[dim]  • {name}[/dim]")
+        
+        if not_tracked:
+            console.print(f"\n[yellow]⚠ {len(not_tracked)} playlist(s) exist but not tracked (run auto-update first to initialize):[/yellow]")
+            for name in not_tracked:
+                console.print(f"[dim]  • {name}[/dim]")
+        
+        if not_found:
+            console.print(f"\n[dim]Skipped {len(not_found)} playlist(s) not found (create them first)[/dim]")
+        
         if not playlists_to_update:
             console.print("[red]No valid playlists to update.[/red]")
             return
@@ -1794,31 +1995,60 @@ def auto_update(playlists, username, batch, playlist_file, dry_run):
                 console.print("[yellow]Batch update cancelled.[/yellow]")
                 return
         
-        # Update each playlist
+        # Update each playlist with spinner progress
         successful = 0
         failed = 0
         skipped = 0
         
-        for p in playlists_to_update:
-            console.print(f"\n[bold cyan]Processing: {p['name']}[/bold cyan]")
-            try:
-                result = _auto_update_single(
-                    sp, tracker, p['label'], username, 
-                    p['name'], p['id'], dry_run
-                )
-                if result == 'success':
-                    successful += 1
-                elif result == 'skipped':
-                    skipped += 1
-                else:
+        from rich.progress import Progress, SpinnerColumn, TextColumn
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=False
+        ) as progress:
+            task = progress.add_task("[cyan]Starting batch update...", total=len(playlists_to_update))
+            
+            for i, p in enumerate(playlists_to_update, 1):
+                progress.update(task, description=f"[cyan]Processing [{i}/{len(playlists_to_update)}]: {p['name']}")
+                
+                try:
+                    result = _auto_update_single(
+                        sp, tracker, p['label'], username, 
+                        p['name'], p['id'], dry_run
+                    )
+                    if result == 'success':
+                        successful += 1
+                    elif result == 'skipped':
+                        skipped += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    console.print(f"[red]Error updating {p['name']}: {e}[/red]")
                     failed += 1
-            except Exception as e:
-                console.print(f"[red]Error updating {p['name']}: {e}[/red]")
-                failed += 1
+                
+                progress.advance(task)
         
         # Summary
         console.print(f"\n[bold]--- Batch Update Summary ---[/bold]")
         console.print(f"Total: {len(playlists_to_update)} | [green]Updated: {successful}[/green] | [yellow]Skipped: {skipped}[/yellow] | [red]Failed: {failed}[/red]")
+        
+        # Show recently updated playlists
+        if recently_updated:
+            console.print(f"\n[dim]Recently Updated ({len(recently_updated)}):[/dim]")
+            console.print("[dim]These playlists were updated within the last 24 hours.[/dim]\n")
+            for name in recently_updated:
+                console.print(f"[dim]  • {name}[/dim]")
+        
+        # Show untracked playlists at end for easy reference
+        if not_tracked:
+            console.print(f"\n[bold yellow]Untracked Playlists ({len(not_tracked)}):[/bold yellow]")
+            console.print("[dim]These playlists exist but haven't been initialized for auto-update.[/dim]")
+            console.print("[dim]Initialize them by running: spotifaj auto-update \"Playlist Name\"[/dim]\n")
+            for name in not_tracked:
+                console.print(f"  • {name}")
+        
         return
     
     # Single playlist mode
@@ -1849,6 +2079,12 @@ def auto_update(playlists, username, batch, playlist_file, dry_run):
             else:
                 logger.info("Operation cancelled.")
                 return
+    
+    # Get label from tracker metadata or use playlist name
+    label = tracker.get_metadata(playlist_id, 'label') if playlist_id else None
+    if not label:
+        label = playlist_name
+        console.print(f"[dim]No label metadata found. Using playlist name '{label}' as label.[/dim]")
     
     # Use the helper function for single playlist update
     try:
@@ -1921,15 +2157,41 @@ def _auto_update_single(sp, tracker, label, username, playlist_name, playlist_id
         
         if not found_tracks:
             console.print("[dim]No new tracks found.[/dim]")
+            if playlist_id:
+                tracker.set_last_update(playlist_id)
+                tracker.set_metadata(playlist_id, 'label', label)
+                if not last_update:
+                    console.print(f"[green]✓ Initialized tracking for '{playlist_name}'[/green]")
+                    console.print(f"[dim]Next update will only fetch tracks after {datetime.now().strftime('%Y-%m-%d')}[/dim]")
             return 'skipped'
         
         # Filter duplicates if playlist exists
         if playlist_id:
+            # 1. ID Check (Fast)
             existing_ids = spotifaj_functions.get_playlist_track_ids(username, playlist_id)
             new_tracks = [t for t in found_tracks if t['id'] not in existing_ids]
             
-            if len(new_tracks) < len(found_tracks):
-                console.print(f"[dim]Filtered {len(found_tracks) - len(new_tracks)} duplicates[/dim]")
+            id_dupes = len(found_tracks) - len(new_tracks)
+            
+            # 2. Metadata Check (Slower but catches cross-album duplicates)
+            if new_tracks:
+                existing_signatures = spotifaj_functions.get_playlist_track_signatures(username, playlist_id)
+                unique_tracks = []
+                for t in new_tracks:
+                    sig = spotifaj_functions.create_track_signature(t)
+                    if sig not in existing_signatures:
+                        unique_tracks.append(t)
+                        # Add to signatures to prevent duplicates within the new batch itself
+                        existing_signatures.add(sig)
+                
+                metadata_dupes = len(new_tracks) - len(unique_tracks)
+                new_tracks = unique_tracks
+            else:
+                metadata_dupes = 0
+            
+            total_dupes = id_dupes + metadata_dupes
+            if total_dupes > 0:
+                console.print(f"[dim]Filtered {total_dupes} duplicates ({id_dupes} by ID, {metadata_dupes} by metadata)[/dim]")
             
             found_tracks = new_tracks
         
@@ -1938,6 +2200,9 @@ def _auto_update_single(sp, tracker, label, username, playlist_name, playlist_id
             if playlist_id:
                 tracker.set_last_update(playlist_id)
                 tracker.set_metadata(playlist_id, 'label', label)
+                if not last_update:
+                    console.print(f"[green]✓ Initialized tracking for '{playlist_name}'[/green]")
+                    console.print(f"[dim]Next update will only fetch tracks after {datetime.now().strftime('%Y-%m-%d')}[/dim]")
             return 'skipped'
         
         console.print(f"[green]Found {len(found_tracks)} new tracks[/green]")
@@ -1957,10 +2222,24 @@ def _auto_update_single(sp, tracker, label, username, playlist_name, playlist_id
             console.print(f"[yellow]Dry run: Would add {len(found_tracks)} tracks[/yellow]")
             return 'skipped'
         
+        # Validate tracks before adding (silently filter out non-matching labels)
+        console.print(f"[dim]Validating tracks against label '{label}'...[/dim]")
+        validated_ids = spotifaj_functions.validate_tracks_list(sp, found_tracks, label, auto_mode=True)
+        
+        if not validated_ids:
+            console.print("[yellow]No valid tracks after label validation.[/yellow]")
+            # Still update tracker to avoid re-checking same tracks
+            tracker.set_last_update(playlist_id)
+            tracker.set_metadata(playlist_id, 'label', label)
+            return 'skipped'
+        
+        if len(validated_ids) < len(found_tracks):
+            filtered_count = len(found_tracks) - len(validated_ids)
+            console.print(f"[dim]Filtered {filtered_count} tracks with non-matching labels[/dim]")
+        
         # Add tracks
-        track_ids = [t['id'] for t in found_tracks]
-        spotifaj_functions.add_song_to_spotify_playlist(username, track_ids, playlist_id)
-        console.print(f"[bold green]✓ Added {len(track_ids)} tracks[/bold green]")
+        spotifaj_functions.add_song_to_spotify_playlist(username, validated_ids, playlist_id)
+        console.print(f"[bold green]✓ Added {len(validated_ids)} tracks[/bold green]")
         
         # Update tracker
         tracker.set_last_update(playlist_id)
