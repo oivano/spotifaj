@@ -17,6 +17,7 @@ Thumbs.db
 .Trashes
 .cache*
 cache
+.auto_update_cache.json
 # Environment variables
 .env
 .venv

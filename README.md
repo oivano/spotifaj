@@ -10,9 +10,13 @@ A powerful, feature-rich command-line interface for managing Spotify playlists, 
 
 *   **Discogs Integration**: Create Spotify playlists from Discogs labels with high accuracy.
 *   **Advanced Search**: Search for tracks by label, year, or exhaustive year-by-year scanning.
-*   **Playlist Portability**: Export playlists to text files and import them back (great for backups or cloning).
-*   **Deduplication**: Find and remove duplicate tracks from your playlists based on ID or metadata (fuzzy matching).
-*   **Smart Caching**: Minimizes API calls to Spotify and Discogs to avoid rate limits and speed up repeated searches.
+*   **Playlist Portability**: Export playlists in multiple formats (TXT, CSV, JSON, M3U) and import them back.
+*   **Smart Deduplication**: Find and remove duplicate tracks with intelligent keep-best logic (popularity, explicit/clean, duration).
+*   **Playlist Analytics**: Analyze playlists with duration stats, decade distribution, artist frequency, and diversity metrics.
+*   **Auto-Update**: Smart playlists that automatically add new label releases since last run.
+*   **Recommendations**: Generate similar tracks based on playlist artists and genres using search-based discovery.
+*   **Cover Image Upload**: Add custom playlist covers from URLs with automatic compression.
+*   **Smart Caching**: SQLite-backed caching minimizes API calls and speeds up operations 10-100x.
 *   **Rich UI**: Beautiful terminal output with progress bars, colors, and tables.
 
 ## Installation
@@ -79,11 +83,20 @@ Use Discogs as the source of truth for a label's discography, then find those tr
 ```
 
 ### 3. Playlist Portability
-Export a playlist to a text file (Artist - Track) or import one.
+Export a playlist in various formats or import from text.
 
 ```bash
-# Export a playlist
+# Export as text (default)
 ./spotifaj export-playlist "Discover Weekly" > discover_backup.txt
+
+# Export as CSV with full metadata
+./spotifaj export-playlist "My Playlist" --format csv -o playlist.csv
+
+# Export as JSON
+./spotifaj export-playlist "My Playlist" --format json -o playlist.json
+
+# Export as M3U playlist file
+./spotifaj export-playlist "My Playlist" --format m3u -o playlist.m3u
 
 # Import a playlist
 ./spotifaj import-playlist discover_backup.txt --name "Discover Weekly Backup"
@@ -92,7 +105,47 @@ Export a playlist to a text file (Artist - Track) or import one.
 ./spotifaj export-playlist "Source Playlist" | ./spotifaj import-playlist --name "Cloned Playlist"
 ```
 
-### 4. Deduplication
+### 4. Playlist Analytics
+Analyze your playlists with detailed statistics.
+
+```bash
+# Analyze a playlist
+./spotifaj analytics "My Favorites"
+
+# Shows: duration stats, decade distribution, top artists, popularity, 
+# explicit content %, and diversity metrics
+```
+
+### 5. Auto-Update Smart Playlists
+Keep label playlists current with new releases.
+
+```bash
+# First run: adds releases from last 30 days
+./spotifaj auto-update "Warp Records"
+
+# Subsequent runs: only adds new tracks since last update
+./spotifaj auto-update "Warp Records"
+
+# Dry run to preview what would be added
+./spotifaj auto-update "Ninja Tune" --dry-run
+
+# Batch update multiple playlists by exact name
+./spotifaj auto-update --batch "Warp Records" "Ninja Tune" "Kompakt"
+
+# Batch update from file (one playlist name per line)
+./spotifaj auto-update --batch --file playlists.txt
+
+# Dry run for batch update
+./spotifaj auto-update --batch --dry-run "Label 1" "Label 2"
+```
+
+**Batch Mode:**
+- Provide exact playlist names as arguments with `--batch`
+- Use `--file` option to read playlist names from a file (one per line)
+- Playlists must be auto-updated at least once to be tracked
+- Shows summary of updated/skipped/failed playlists
+
+### 6. Deduplication
 Clean up your playlists by removing duplicate tracks.
 
 ```bash
@@ -101,9 +154,48 @@ Clean up your playlists by removing duplicate tracks.
 
 # Check ALL your playlists (dry run)
 ./spotifaj deduplicate --all --dry-run
+
+# Smart deduplication: keep most popular version
+./spotifaj deduplicate "My Playlist" --keep-best popularity
+
+# Keep explicit or clean versions
+./spotifaj deduplicate "My Playlist" --keep-best explicit
+./spotifaj deduplicate "My Playlist" --keep-best clean
+
+# Keep longest or shortest versions
+./spotifaj deduplicate "My Playlist" --keep-best longest
 ```
 
-### 5. General Search
+### 7. Recommendations
+Generate similar tracks based on a playlist's artists and genres.
+
+```bash
+# Generates recommendations and prompts to create playlist
+./spotifaj recommend "My Playlist"
+
+# Generate more recommendations
+./spotifaj recommend "Chill Vibes" --limit 100
+```
+
+**Behavior:**
+- Finds similar tracks from playlist artists and genres
+- Strict diversity: max 1 track per album, mostly 1 per artist (20% chance for 2nd)
+- Prompts to create playlist "[Source Name] — Recommendations" if ≥10 tracks found
+
+**Note:** Uses search-based discovery. Audio features analysis requires Extended Quota Mode (organizations only, 250k+ MAU).
+
+### 8. Playlist Cover Images
+Add custom cover art to your playlists.
+
+```bash
+# The import-playlist command will prompt for cover images
+./spotifaj import-playlist tracks.txt --name "My Mix"
+# (Interactive prompt: "Would you like to add a cover image?")
+# Enter URL: https://example.com/image.jpg
+# Auto-compresses to fit Spotify's 256KB limit
+```
+
+### 9. General Search
 Quickly search for tracks, artists, or albums.
 
 ```bash

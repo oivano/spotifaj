@@ -49,7 +49,7 @@ except ImportError as e:
     SpotifyLabelWorkflow = None
 
 console = Console()
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 @click.group()
 @click.version_option(__version__)
@@ -431,21 +431,66 @@ def search(query, type):
 @click.argument('username')
 def list_playlists(username):
     """List a user's playlists."""
-    sp = spotifaj_functions.get_spotify_client(username=username, scope="playlist-read-private")
+    sp = spotifaj_functions.get_spotify_client(username=username)
     if not sp:
         logger.error("Failed to initialize Spotify client.")
         sys.exit(1)
         
     try:
+        all_playlists = []
         playlists = sp.user_playlists(username)
         while playlists:
-            for playlist in playlists['items']:
-                print(f"{playlist['name']} (ID: {playlist['id']}, Tracks: {playlist['tracks']['total']})")
-            
+            all_playlists.extend(playlists['items'])
             if playlists['next']:
                 playlists = sp.next(playlists)
             else:
-                playlists = None
+                break
+        
+        # Display in numbered format like search command
+        from rich.markup import escape
+        for i, playlist in enumerate(all_playlists, 1):
+            name = playlist['name']
+            uri = playlist.get('uri', '')
+            
+            def fmt_link(text, target):
+                return f"[link={target}]{escape(text)}[/link]" if target else escape(text)
+            
+            console.print(f"{i:>2}. {fmt_link(name, uri)}", highlight=False)
+            
+    except Exception as e:
+        logger.error(f"Error fetching playlists: {e}")
+
+@spotifaj.command()
+@click.option('--username', default=settings.spotipy_username, help="Spotify username.")
+@click.option('--verbose', '-v', is_flag=True, help="Include track count and ownership info.")
+def export_playlist_names(username, verbose):
+    """Export all playlist names from your profile (one per line)."""
+    sp = spotifaj_functions.get_spotify_client(username=username)
+    if not sp:
+        logger.error("Failed to initialize Spotify client.")
+        sys.exit(1)
+    
+    try:
+        all_playlists = spotifaj_functions.fetch_all_user_playlists(username)
+        
+        if not all_playlists:
+            console.print("[yellow]No playlists found.[/yellow]")
+            return
+        
+        # Output playlist names (one per line for easy export)
+        for playlist in all_playlists:
+            if verbose:
+                owner = playlist['owner']['id']
+                owned = "✓" if owner == username else f"(by {owner})"
+                track_count = playlist['tracks']['total']
+                print(f"{playlist['name']}\t{track_count} tracks\t{owned}")
+            else:
+                print(playlist['name'])
+        
+        # Show count to stderr so it doesn't interfere with piping
+        import sys
+        sys.stderr.write(f"\nTotal: {len(all_playlists)} playlists\n")
+        
     except Exception as e:
         logger.error(f"Error fetching playlists: {e}")
 
@@ -583,11 +628,18 @@ def search_and_add(query, username, playlist, artist, album, track, limit, fetch
 @click.option('--username', default=settings.spotipy_username, help="Spotify username.")
 @click.option('--all', 'check_all', is_flag=True, help="Check ALL user playlists for duplicates.")
 @click.option('--dry-run', is_flag=True, help="Show duplicates without removing them.")
-def deduplicate(playlist_input, username, check_all, dry_run):
+@click.option('--keep-best', type=click.Choice(['popularity', 'explicit', 'clean', 'longest', 'shortest']), help="When removing duplicates, keep the best version based on criteria.")
+def deduplicate(playlist_input, username, check_all, dry_run, keep_best):
     """
-    Check for duplicate tracks in a playlist.
+    Check for duplicate tracks in a playlist with smart keep-best logic.
     
     PLAYLIST_INPUT can be a Spotify Playlist URL or a Playlist Name.
+    --keep-best options:
+      popularity: Keep the most popular version
+      explicit: Prefer explicit versions
+      clean: Prefer clean (non-explicit) versions
+      longest: Keep the longest version
+      shortest: Keep the shortest version
     """
     if not playlist_input and not check_all:
         logger.error("Please provide a PLAYLIST_INPUT or use --all.")
@@ -668,6 +720,70 @@ def deduplicate(playlist_input, username, check_all, dry_run):
             progress.update(task, description=f"[cyan]'{name}'...[/cyan]")
             
             duplicates = spotifaj_functions.find_duplicates_in_playlist(username, pid)
+            
+            if duplicates and keep_best:
+                # Apply keep-best logic to determine which versions to keep
+                # Group duplicates by signature
+                from collections import defaultdict
+                dup_groups = defaultdict(list)
+                
+                for d in duplicates:
+                    # Create signature from original track
+                    orig = d['original']
+                    sig = spotifaj_functions.create_track_signature(orig)
+                    dup_groups[sig].append(d)
+                
+                # For each group, select best version to keep
+                refined_duplicates = []
+                
+                for sig, group in dup_groups.items():
+                    # Get all versions (original + duplicates)
+                    all_versions = [g['original'] for g in group] + [g['duplicate'] for g in group]
+                    
+                    # Deduplicate by URI
+                    unique_versions = {}
+                    for v in all_versions:
+                        unique_versions[v['uri']] = v
+                    versions = list(unique_versions.values())
+                    
+                    if len(versions) < 2:
+                        continue
+                    
+                    # Select best based on criteria
+                    if keep_best == 'popularity':
+                        best = max(versions, key=lambda t: t.get('popularity', 0))
+                    elif keep_best == 'explicit':
+                        # Prefer explicit, then by popularity
+                        explicit_versions = [v for v in versions if v.get('explicit', False)]
+                        if explicit_versions:
+                            best = max(explicit_versions, key=lambda t: t.get('popularity', 0))
+                        else:
+                            best = max(versions, key=lambda t: t.get('popularity', 0))
+                    elif keep_best == 'clean':
+                        # Prefer clean (non-explicit), then by popularity
+                        clean_versions = [v for v in versions if not v.get('explicit', False)]
+                        if clean_versions:
+                            best = max(clean_versions, key=lambda t: t.get('popularity', 0))
+                        else:
+                            best = max(versions, key=lambda t: t.get('popularity', 0))
+                    elif keep_best == 'longest':
+                        best = max(versions, key=lambda t: t.get('duration_ms', 0))
+                    elif keep_best == 'shortest':
+                        best = min(versions, key=lambda t: t.get('duration_ms', float('inf')))
+                    else:
+                        best = versions[0]
+                    
+                    # Mark all other versions as duplicates to remove
+                    for g in group:
+                        if g['duplicate']['uri'] != best['uri']:
+                            refined_duplicates.append(g)
+                
+                duplicates = refined_duplicates
+                count = len(duplicates)
+                
+                if count == 0:
+                    progress.advance(task)
+                    continue
             
             if duplicates:
                 count = len(duplicates)
@@ -772,12 +888,14 @@ def deduplicate(playlist_input, username, check_all, dry_run):
 @spotifaj.command()
 @click.argument('playlist_input')
 @click.option('--username', default=settings.spotipy_username, help="Spotify username.")
-def export_playlist(playlist_input, username):
+@click.option('--format', '-f', type=click.Choice(['txt', 'csv', 'json', 'm3u']), default='txt', help="Export format.")
+@click.option('--output', '-o', type=click.Path(), help="Output file path. If not specified, prints to stdout.")
+def export_playlist(playlist_input, username, format, output):
     """
-    Export a playlist to a text list (Artist - Track).
+    Export a playlist in various formats.
     
     PLAYLIST_INPUT can be a Spotify Playlist URL, ID, or Name.
-    Output is printed to stdout, so it can be redirected to a file.
+    Formats: txt (Artist - Track), csv (full metadata), json, m3u (playlist file)
     """
     sp = spotifaj_functions.get_spotify_client(username=username)
     if not sp:
@@ -805,24 +923,100 @@ def export_playlist(playlist_input, username):
     logger.info(f"Exporting playlist ID: {playlist_id}...", extra={"markup": True})
     
     try:
+        # Get playlist info
+        playlist_info = sp.playlist(playlist_id)
+        playlist_name = playlist_info['name']
+        
         results = sp.playlist_items(playlist_id)
         tracks = results['items']
         
         while results['next']:
             results = sp.next(results)
             tracks.extend(results['items'])
-            
-        # Print to stdout for redirection
+        
+        # Filter out None tracks
+        valid_tracks = []
         for item in tracks:
-            if not item or 'track' not in item or not item['track']:
-                continue
-                
-            track = item['track']
-            name = track['name']
-            artists = ", ".join([artist['name'] for artist in track['artists']])
+            if item and 'track' in item and item['track']:
+                valid_tracks.append(item)
+        
+        # Generate output based on format
+        import json
+        import csv
+        from io import StringIO
+        
+        output_content = None
+        
+        if format == 'txt':
+            lines = []
+            for item in valid_tracks:
+                track = item['track']
+                artists = ", ".join([a['name'] for a in track['artists']])
+                lines.append(f"{artists} - {track['name']}")
+            output_content = "\n".join(lines)
             
-            # Print clean "Artist - Title" format
-            print(f"{artists} - {name}")
+        elif format == 'csv':
+            output_buffer = StringIO()
+            writer = csv.writer(output_buffer)
+            writer.writerow(['Artist', 'Track', 'Album', 'Year', 'Duration (ms)', 'Popularity', 'ISRC', 'Spotify URI'])
+            
+            for item in valid_tracks:
+                track = item['track']
+                artists = ", ".join([a['name'] for a in track['artists']])
+                album = track['album']['name']
+                year = track['album'].get('release_date', '')[:4] if track['album'].get('release_date') else ''
+                duration = track['duration_ms']
+                popularity = track.get('popularity', 0)
+                isrc = track.get('external_ids', {}).get('isrc', '')
+                uri = track['uri']
+                
+                writer.writerow([artists, track['name'], album, year, duration, popularity, isrc, uri])
+            
+            output_content = output_buffer.getvalue()
+            
+        elif format == 'json':
+            playlist_data = {
+                'name': playlist_name,
+                'id': playlist_id,
+                'total_tracks': len(valid_tracks),
+                'tracks': []
+            }
+            
+            for item in valid_tracks:
+                track = item['track']
+                track_data = {
+                    'name': track['name'],
+                    'artists': [a['name'] for a in track['artists']],
+                    'album': track['album']['name'],
+                    'release_date': track['album'].get('release_date', ''),
+                    'duration_ms': track['duration_ms'],
+                    'popularity': track.get('popularity', 0),
+                    'explicit': track.get('explicit', False),
+                    'isrc': track.get('external_ids', {}).get('isrc', ''),
+                    'uri': track['uri'],
+                    'spotify_url': track['external_urls'].get('spotify', '')
+                }
+                playlist_data['tracks'].append(track_data)
+            
+            output_content = json.dumps(playlist_data, indent=2)
+            
+        elif format == 'm3u':
+            lines = ['#EXTM3U']
+            for item in valid_tracks:
+                track = item['track']
+                artists = ", ".join([a['name'] for a in track['artists']])
+                duration_sec = track['duration_ms'] // 1000
+                lines.append(f"#EXTINF:{duration_sec},{artists} - {track['name']}")
+                lines.append(track['external_urls'].get('spotify', track['uri']))
+            output_content = "\n".join(lines)
+        
+        # Output to file or stdout
+        if output:
+            with open(output, 'w', encoding='utf-8') as f:
+                f.write(output_content)
+            console.print(f"[green]Exported {len(valid_tracks)} tracks to {output}[/green]")
+        else:
+            print(output_content)
             
     except Exception as e:
         logger.error(f"Error exporting playlist: {e}")
@@ -1346,6 +1540,670 @@ def import_playlist(input_file, name, username):
                     console.print(f"[red]Failed to upload cover image: {e}[/red]")
         else:
             logger.error("Failed to create playlist.")
+
+@spotifaj.command()
+@click.argument('playlist_input')
+@click.option('--username', default=settings.spotipy_username, help="Spotify username.")
+def analytics(playlist_input, username):
+    """
+    Analyze playlist statistics and metadata.
+    
+    Shows duration, genre distribution, decade analysis, artist frequency, and more.
+    PLAYLIST_INPUT can be a Spotify Playlist URL, ID, or Name.
+    """
+    sp = spotifaj_functions.get_spotify_client(username=username)
+    if not sp:
+        logger.error("Failed to initialize Spotify client.")
+        sys.exit(1)
+
+    # Parse playlist input
+    playlist_id = None
+    match = re.search(r'playlist/([a-zA-Z0-9]+)', playlist_input)
+    if match:
+        playlist_id = match.group(1)
+    elif re.match(r'^[a-zA-Z0-9]{22}$', playlist_input):
+        playlist_id = playlist_input
+    
+    if not playlist_id:
+        logger.info(f"Searching for playlist with name: '{playlist_input}'...")
+        playlist_id = spotifaj_functions.find_playlist_by_name(username, playlist_input)
+
+    if not playlist_id:
+        logger.error(f"Could not find playlist: {playlist_input}")
+        sys.exit(1)
+
+    try:
+        # Get playlist info
+        playlist_info = sp.playlist(playlist_id)
+        playlist_name = playlist_info['name']
+        
+        console.print(f"\n[bold cyan]Analyzing playlist: {playlist_name}[/bold cyan]\n")
+        
+        # Fetch all tracks
+        results = sp.playlist_items(playlist_id)
+        tracks = results['items']
+        
+        while results['next']:
+            results = sp.next(results)
+            tracks.extend(results['items'])
+        
+        # Filter valid tracks
+        valid_tracks = [item for item in tracks if item and 'track' in item and item['track']]
+        total_tracks = len(valid_tracks)
+        
+        if total_tracks == 0:
+            console.print("[yellow]No tracks found in playlist.[/yellow]")
+            return
+        
+        # === Duration Statistics ===
+        durations = [t['track']['duration_ms'] for t in valid_tracks]
+        total_duration_ms = sum(durations)
+        avg_duration_ms = total_duration_ms / total_tracks
+        min_duration_ms = min(durations)
+        max_duration_ms = max(durations)
+        
+        def format_duration(ms):
+            hours, remainder = divmod(ms // 1000, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            if hours > 0:
+                return f"{hours}h {minutes}m {seconds}s"
+            return f"{minutes}m {seconds}s"
+        
+        console.print("[bold]Duration Statistics:[/bold]")
+        console.print(f"  Total Duration: [cyan]{format_duration(total_duration_ms)}[/cyan]")
+        console.print(f"  Average Track: [cyan]{format_duration(avg_duration_ms)}[/cyan]")
+        console.print(f"  Shortest: [cyan]{format_duration(min_duration_ms)}[/cyan]")
+        console.print(f"  Longest: [cyan]{format_duration(max_duration_ms)}[/cyan]")
+        console.print()
+        
+        # === Decade Distribution ===
+        decades = {}
+        unknown_year = 0
+        
+        for item in valid_tracks:
+            track = item['track']
+            release_date = track['album'].get('release_date', '')
+            if release_date and len(release_date) >= 4:
+                try:
+                    year = int(release_date[:4])
+                    decade = (year // 10) * 10
+                    decades[decade] = decades.get(decade, 0) + 1
+                except ValueError:
+                    unknown_year += 1
+            else:
+                unknown_year += 1
+        
+        console.print("[bold]Decade Distribution:[/bold]")
+        for decade in sorted(decades.keys()):
+            count = decades[decade]
+            percentage = (count / total_tracks) * 100
+            bar = '█' * int(percentage / 2)
+            console.print(f"  {decade}s: [green]{bar}[/green] {count} ({percentage:.1f}%)")
+        if unknown_year > 0:
+            percentage = (unknown_year / total_tracks) * 100
+            console.print(f"  Unknown: {unknown_year} ({percentage:.1f}%)")
+        console.print()
+        
+        # === Artist Frequency ===
+        artist_counts = {}
+        for item in valid_tracks:
+            track = item['track']
+            for artist in track['artists']:
+                name = artist['name']
+                artist_counts[name] = artist_counts.get(name, 0) + 1
+        
+        top_artists = sorted(artist_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        
+        console.print("[bold]Top 10 Artists:[/bold]")
+        for i, (artist, count) in enumerate(top_artists, 1):
+            percentage = (count / total_tracks) * 100
+            console.print(f"  {i:>2}. [magenta]{artist}[/magenta]: {count} tracks ({percentage:.1f}%)")
+        console.print()
+        
+        # === Popularity Statistics ===
+        popularities = [t['track'].get('popularity', 0) for t in valid_tracks]
+        avg_popularity = sum(popularities) / len(popularities) if popularities else 0
+        
+        console.print("[bold]Popularity:[/bold]")
+        console.print(f"  Average Popularity: [cyan]{avg_popularity:.1f}/100[/cyan]")
+        console.print()
+        
+        # === Explicit Content ===
+        explicit_count = sum(1 for item in valid_tracks if item['track'].get('explicit', False))
+        explicit_pct = (explicit_count / total_tracks) * 100
+        
+        console.print("[bold]Content:[/bold]")
+        console.print(f"  Explicit Tracks: [yellow]{explicit_count}[/yellow] ({explicit_pct:.1f}%)")
+        console.print(f"  Clean Tracks: [green]{total_tracks - explicit_count}[/green] ({100 - explicit_pct:.1f}%)")
+        console.print()
+        
+        # === Album Diversity ===
+        unique_albums = set()
+        for item in valid_tracks:
+            track = item['track']
+            unique_albums.add(track['album']['id'])
+        
+        console.print("[bold]Diversity:[/bold]")
+        console.print(f"  Unique Artists: [cyan]{len(artist_counts)}[/cyan]")
+        console.print(f"  Unique Albums: [cyan]{len(unique_albums)}[/cyan]")
+        console.print(f"  Tracks per Artist (avg): [cyan]{total_tracks / len(artist_counts):.1f}[/cyan]")
+        console.print()
+        
+    except Exception as e:
+        logger.error(f"Error analyzing playlist: {e}")
+
+@spotifaj.command()
+@click.argument('playlists', nargs=-1, required=False)
+@click.option('--username', default=settings.spotipy_username, help="Spotify username.")
+@click.option('--batch', is_flag=True, help="Auto-update multiple playlists (provide playlist names as arguments).")
+@click.option('--file', '-f', 'playlist_file', type=click.Path(exists=True), help="Read playlist names from file (one per line).")
+@click.option('--dry-run', is_flag=True, help="Show what would be added without actually updating.")
+def auto_update(playlists, username, batch, playlist_file, dry_run):
+    """
+    Auto-update label playlists with new releases since last run.
+    
+    Tracks the last update time and only adds tracks released after that.
+    Perfect for keeping label playlists current with new releases.
+    
+    Examples:
+      # Single playlist
+      spotifaj auto-update "Warp Records"
+      
+      # Batch update multiple playlists
+      spotifaj auto-update --batch "Warp Records" "Ninja Tune" "Kompakt"
+      
+      # Batch update from file
+      spotifaj auto-update --batch --file playlists.txt
+    """
+    try:
+        from utils.auto_update_tracker import AutoUpdateTracker
+    except ImportError:
+        logger.error("Auto-update tracker module not found.")
+        return
+
+    sp = spotifaj_functions.get_spotify_client(username=username)
+    if not sp:
+        logger.error("Failed to initialize Spotify client.")
+        sys.exit(1)
+
+    tracker = AutoUpdateTracker()
+    
+    # Load playlist names from file if provided
+    playlist_list = list(playlists) if playlists else []
+    if playlist_file:
+        try:
+            with open(playlist_file, 'r') as f:
+                file_playlists = [line.strip() for line in f if line.strip()]
+                playlist_list.extend(file_playlists)
+        except Exception as e:
+            console.print(f"[red]Error reading file '{playlist_file}': {e}[/red]")
+            return
+    
+    # Batch mode: update multiple playlists by exact name
+    if batch:
+        if not playlist_list or len(playlist_list) == 0:
+            console.print("[red]Error: --batch requires playlist names or --file option.[/red]")
+            console.print("[dim]Usage: spotifaj auto-update --batch \"Playlist 1\" \"Playlist 2\"[/dim]")
+            console.print("[dim]       spotifaj auto-update --batch --file playlists.txt[/dim]")
+            return
+        
+        console.print(f"[bold cyan]Batch updating {len(playlist_list)} playlists...[/bold cyan]")
+        
+        # Get tracker metadata for all playlists
+        tracked_playlists = tracker.get_all_tracked()
+        
+        # Build list of playlists to update with their metadata
+        playlists_to_update = []
+        for playlist_name in playlist_list:
+            # Find playlist ID
+            playlist_id = spotifaj_functions.find_playlist_by_name(username, playlist_name)
+            
+            if not playlist_id:
+                console.print(f"[yellow]⚠ Playlist '{playlist_name}' not found. Skipping.[/yellow]")
+                continue
+            
+            # Check if tracked and has label metadata
+            if playlist_id not in tracked_playlists:
+                console.print(f"[yellow]⚠ Playlist '{playlist_name}' is not tracked. Skipping.[/yellow]")
+                console.print(f"[dim]  Hint: Run 'spotifaj auto-update \"{playlist_name}\"' first to initialize tracking.[/dim]")
+                continue
+            
+            metadata = tracked_playlists[playlist_id].get('metadata', {})
+            stored_label = metadata.get('label')
+            
+            if not stored_label:
+                console.print(f"[yellow]⚠ Playlist '{playlist_name}' has no label metadata. Skipping.[/yellow]")
+                continue
+            
+            playlists_to_update.append({
+                'id': playlist_id,
+                'name': playlist_name,
+                'label': stored_label
+            })
+        
+        if not playlists_to_update:
+            console.print("[red]No valid playlists to update.[/red]")
+            return
+        
+        console.print(f"[green]Found {len(playlists_to_update)} playlists to update:[/green]")
+        for p in playlists_to_update:
+            console.print(f"  • {p['name']} (label: {p['label']})")
+        
+        if not dry_run:
+            if not spotifaj_functions.confirm(f"\nUpdate all {len(playlists_to_update)} playlists?", default=True):
+                console.print("[yellow]Batch update cancelled.[/yellow]")
+                return
+        
+        # Update each playlist
+        successful = 0
+        failed = 0
+        skipped = 0
+        
+        for p in playlists_to_update:
+            console.print(f"\n[bold cyan]Processing: {p['name']}[/bold cyan]")
+            try:
+                result = _auto_update_single(
+                    sp, tracker, p['label'], username, 
+                    p['name'], p['id'], dry_run
+                )
+                if result == 'success':
+                    successful += 1
+                elif result == 'skipped':
+                    skipped += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                console.print(f"[red]Error updating {p['name']}: {e}[/red]")
+                failed += 1
+        
+        # Summary
+        console.print(f"\n[bold]--- Batch Update Summary ---[/bold]")
+        console.print(f"Total: {len(playlists_to_update)} | [green]Updated: {successful}[/green] | [yellow]Skipped: {skipped}[/yellow] | [red]Failed: {failed}[/red]")
+        return
+    
+    # Single playlist mode
+    if not playlist_list or len(playlist_list) != 1:
+        console.print("[red]Error: Provide exactly one playlist name, or use --batch for multiple.[/red]")
+        console.print("[dim]Usage: spotifaj auto-update \"Playlist Name\"[/dim]")
+        console.print("[dim]       spotifaj auto-update --batch \"Playlist 1\" \"Playlist 2\"[/dim]")
+        console.print("[dim]       spotifaj auto-update --batch --file playlists.txt[/dim]")
+        return
+    
+    playlist_name = playlist_list[0]
+    
+    # Find or create playlist
+    playlist_id = spotifaj_functions.find_playlist_by_name(username, playlist_name)
+    
+    if not playlist_id:
+        if dry_run:
+            console.print(f"[yellow]Playlist '{playlist_name}' does not exist. Would create it in live mode.[/yellow]")
+            # Exit in dry-run mode
+            return
+        else:
+            if spotifaj_functions.confirm(f"Playlist '{playlist_name}' not found. Create it?", default=True):
+                logger.info(f"Creating playlist '{playlist_name}'...")
+                playlist_id = spotifaj_functions.create_playlist(username, playlist_name)
+                if not playlist_id:
+                    logger.error("Failed to create playlist.")
+                    return
+            else:
+                logger.info("Operation cancelled.")
+                return
+    
+    # Use the helper function for single playlist update
+    try:
+        result = _auto_update_single(sp, tracker, label, username, playlist_name, playlist_id, dry_run)
+        if result == 'success':
+            from datetime import datetime
+            console.print(f"[dim]Tracker updated. Next run will only fetch tracks after {datetime.now().isoformat()}[/dim]")
+        elif result == 'failed':
+            logger.error("Auto-update failed.")
+    except Exception as e:
+        logger.error(f"Error during auto-update: {e}")
+
+def _auto_update_single(sp, tracker, label, username, playlist_name, playlist_id=None, dry_run=False):
+    """
+    Helper function to auto-update a single playlist.
+    Returns 'success', 'skipped', or 'failed'.
+    """
+    from datetime import datetime, timedelta
+    
+    # Find or verify playlist
+    if not playlist_id:
+        playlist_id = spotifaj_functions.find_playlist_by_name(username, playlist_name)
+    
+    if not playlist_id:
+        if dry_run:
+            console.print(f"[yellow]Playlist '{playlist_name}' does not exist. Would create it in live mode.[/yellow]")
+        else:
+            console.print(f"[yellow]Playlist '{playlist_name}' not found. Skipping.[/yellow]")
+            return 'skipped'
+    
+    # Get last update time
+    last_update = tracker.get_last_update(playlist_id) if playlist_id else None
+    
+    if last_update:
+        console.print(f"[dim]Last update: {last_update}[/dim]")
+        last_date = datetime.fromisoformat(last_update).strftime('%Y-%m-%d')
+    else:
+        console.print(f"[dim]First time update. Fetching recent releases.[/dim]")
+        last_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    
+    # Search for new releases
+    console.print(f"[dim]Searching for releases from {label} since {last_date}...[/dim]")
+    
+    try:
+        query = f'label:"{label}"'
+        found_tracks = []
+        offset = 0
+        limit = 50
+        
+        while True:
+            results = sp.search(q=query, type='track', limit=limit, offset=offset, market='US')
+            items = results['tracks']['items']
+            
+            if not items:
+                break
+            
+            for track in items:
+                release_date = track['album'].get('release_date', '')
+                if release_date >= last_date:
+                    found_tracks.append(track)
+            
+            if len(items) < limit:
+                break
+            
+            offset += limit
+            if offset >= 1000:
+                break
+        
+        found_tracks.sort(key=lambda t: t['album'].get('release_date', ''), reverse=True)
+        
+        if not found_tracks:
+            console.print("[dim]No new tracks found.[/dim]")
+            return 'skipped'
+        
+        # Filter duplicates if playlist exists
+        if playlist_id:
+            existing_ids = spotifaj_functions.get_playlist_track_ids(username, playlist_id)
+            new_tracks = [t for t in found_tracks if t['id'] not in existing_ids]
+            
+            if len(new_tracks) < len(found_tracks):
+                console.print(f"[dim]Filtered {len(found_tracks) - len(new_tracks)} duplicates[/dim]")
+            
+            found_tracks = new_tracks
+        
+        if not found_tracks:
+            console.print("[dim]All tracks already in playlist.[/dim]")
+            if playlist_id:
+                tracker.set_last_update(playlist_id)
+                tracker.set_metadata(playlist_id, 'label', label)
+            return 'skipped'
+        
+        console.print(f"[green]Found {len(found_tracks)} new tracks[/green]")
+        
+        # Show sample
+        if len(found_tracks) <= 5:
+            for track in found_tracks:
+                artists = ", ".join([a['name'] for a in track['artists']])
+                console.print(f"  • {artists} - {track['name']}")
+        else:
+            for track in found_tracks[:3]:
+                artists = ", ".join([a['name'] for a in track['artists']])
+                console.print(f"  • {artists} - {track['name']}")
+            console.print(f"  ... and {len(found_tracks) - 3} more")
+        
+        if dry_run:
+            console.print(f"[yellow]Dry run: Would add {len(found_tracks)} tracks[/yellow]")
+            return 'skipped'
+        
+        # Add tracks
+        track_ids = [t['id'] for t in found_tracks]
+        spotifaj_functions.add_song_to_spotify_playlist(username, track_ids, playlist_id)
+        console.print(f"[bold green]✓ Added {len(track_ids)} tracks[/bold green]")
+        
+        # Update tracker
+        tracker.set_last_update(playlist_id)
+        tracker.set_metadata(playlist_id, 'label', label)
+        
+        return 'success'
+        
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        logger.exception(f"Failed to update {playlist_name}")
+        return 'failed'
+
+@spotifaj.command()
+@click.argument('playlist_input')
+@click.option('--username', default=settings.spotipy_username, help="Spotify username.")
+@click.option('--limit', default=50, help="Number of recommendations to generate.")
+@click.option('-n', '--name', 'target_name', default=None, help="Custom name for the recommendations playlist.")
+def recommend(playlist_input, username, limit, target_name):
+    """
+    Generate track recommendations based on a playlist's artists and genres.
+    
+    Analyzes the playlist's top artists and their genres to find similar tracks.
+    Automatically creates a new playlist with recommendations (min 10 tracks).
+    
+    PLAYLIST_INPUT can be a Spotify Playlist URL, ID, or Name.
+    """
+    sp = spotifaj_functions.get_spotify_client(username=username)
+    if not sp:
+        logger.error("Failed to initialize Spotify client.")
+        sys.exit(1)
+
+    # Parse playlist input
+    playlist_id = None
+    match = re.search(r'playlist/([a-zA-Z0-9]+)', playlist_input)
+    if match:
+        playlist_id = match.group(1)
+    elif re.match(r'^[a-zA-Z0-9]{22}$', playlist_input):
+        playlist_id = playlist_input
+    
+    if not playlist_id:
+        logger.info(f"Searching for playlist with name: '{playlist_input}'...")
+        playlist_id = spotifaj_functions.find_playlist_by_name(username, playlist_input)
+
+    if not playlist_id:
+        logger.error(f"Could not find playlist: {playlist_input}")
+        sys.exit(1)
+
+    try:
+        # Get playlist info
+        playlist_info = sp.playlist(playlist_id)
+        playlist_name = playlist_info['name']
+        
+        console.print(f"\n[bold cyan]Analyzing playlist: {playlist_name}[/bold cyan]")
+        
+        # Fetch all tracks
+        results = sp.playlist_items(playlist_id)
+        tracks = results['items']
+        
+        while results['next']:
+            results = sp.next(results)
+            tracks.extend(results['items'])
+        
+        # Filter valid tracks
+        valid_tracks = [item['track'] for item in tracks if item and 'track' in item and item['track']]
+        
+        if len(valid_tracks) == 0:
+            console.print("[yellow]No tracks found in playlist.[/yellow]")
+            return
+        
+        # Scale analysis based on playlist size
+        # Small playlists (<= 50): analyze ALL tracks
+        # Large playlists: analyze up to 80%
+        if len(valid_tracks) <= 50:
+            analysis_count = len(valid_tracks)
+        else:
+            analysis_count = min(len(valid_tracks), int(len(valid_tracks) * 0.8))
+        
+        track_ids = [t['id'] for t in valid_tracks[:analysis_count]]
+        
+        console.print(f"[cyan]Analyzing {len(track_ids)} of {len(valid_tracks)} tracks...[/cyan]")
+        console.print("[dim]Note: Audio features unavailable in Development Mode (requires Extended Quota)[/dim]\n")
+        
+        # Get top artists from playlist (analyze at least 50%, all for small playlists)
+        if len(valid_tracks) <= 50:
+            artist_analysis_count = len(valid_tracks)
+        else:
+            artist_analysis_count = min(len(valid_tracks), max(50, int(len(valid_tracks) * 0.5)))
+        
+        artist_counts = {}
+        for track in valid_tracks[:artist_analysis_count]:
+            for artist in track['artists']:
+                artist_id = artist['id']
+                artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
+        
+        # Get top 25 artists, then randomly select 2-4 from them for variety
+        import random
+        top_artists = sorted(artist_counts.items(), key=lambda x: x[1], reverse=True)[:25]
+        num_seeds = random.randint(2, min(4, len(top_artists)))
+        artist_seeds = random.sample([a[0] for a in top_artists], num_seeds)
+        
+        console.print(f"[cyan]Finding similar tracks based on playlist artists and genres...[/cyan]")
+        
+        # Use search-based recommendations (Spotify Recommendations API blocked in Development Mode)
+        rec_tracks = []
+        try:
+            search_artists = []
+            all_genres = []
+            
+            # Get artist names and genres
+            for artist_id in artist_seeds:
+                artist_info = sp.artist(artist_id)
+                search_artists.append(artist_info['name'])
+                all_genres.extend(artist_info.get('genres', []))
+            
+            # Randomly select which genres to search (for variety between runs)
+            unique_genres = list(set(all_genres))
+            random.shuffle(unique_genres)
+            genres_to_search = unique_genres[:random.randint(2, min(5, len(unique_genres)))]
+            
+            # Randomly shuffle artists to search in different order each time
+            random.shuffle(search_artists)
+            
+            # Search using artist names and genres
+            all_results = []
+            for artist_name in search_artists[:3]:  # Use up to 3 random artists
+                query = f'artist:"{artist_name}"'
+                # Vary the limit randomly for more variety
+                search_limit = random.randint(15, 30)
+                results = sp.search(q=query, type='track', limit=search_limit)
+                if results and 'tracks' in results and 'items' in results['tracks']:
+                    all_results.extend(results['tracks']['items'])
+            
+            # Also search by genre if available
+            for genre in genres_to_search:
+                query = f'genre:"{genre}"'
+                try:
+                    # Vary search limit for different results each time
+                    genre_limit = random.randint(10, 25)
+                    results = sp.search(q=query, type='track', limit=genre_limit)
+                    if results and 'tracks' in results and 'items' in results['tracks']:
+                        all_results.extend(results['tracks']['items'])
+                except:
+                    pass
+            
+            # Deduplicate by track ID and track name (same song, different albums)
+            seen_ids = set()
+            seen_names = set()
+            unique_results = []
+            for track in all_results:
+                track_name_normalized = track['name'].lower().strip()
+                if track['id'] not in seen_ids and track_name_normalized not in seen_names:
+                    seen_ids.add(track['id'])
+                    seen_names.add(track_name_normalized)
+                    unique_results.append(track)
+            
+            # Apply diversity filtering: limit tracks per album and artist
+            album_counts = {}
+            artist_counts = {}  # Track all artists in a song, not just primary
+            diverse_results = []
+            
+            random.shuffle(unique_results)  # Randomize before filtering
+            
+            for track in unique_results:
+                album_id = track['album']['id']
+                
+                # Get all artist IDs from the track (including featured artists)
+                all_artist_ids = [a['id'] for a in track['artists'] if a and 'id' in a]
+                
+                # Check if album limit reached (max 1 per album)
+                if album_counts.get(album_id, 0) >= 1:
+                    continue
+                
+                # Check artist limits - be strict about variety
+                artist_limit_reached = False
+                for artist_id in all_artist_ids:
+                    current_count = artist_counts.get(artist_id, 0)
+                    # Most artists get only 1 track (strict diversity)
+                    # Only 20% chance to allow a 2nd track from same artist
+                    if current_count >= 1:
+                        if current_count >= 2 or random.random() > 0.2:
+                            artist_limit_reached = True
+                            break
+                
+                if artist_limit_reached:
+                    continue
+                
+                # Add track and update counts for ALL artists
+                diverse_results.append(track)
+                album_counts[album_id] = album_counts.get(album_id, 0) + 1
+                for artist_id in all_artist_ids:
+                    artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
+                
+                # Stop when we have enough
+                if len(diverse_results) >= limit * 2:  # Get 2x to account for playlist filtering
+                    break
+            
+            rec_tracks = diverse_results[:limit]
+            
+        except Exception as search_error:
+            logger.error(f"Search-based recommendations failed: {search_error}")
+            console.print(f"[red]Could not generate recommendations: {search_error}[/red]")
+            return
+        
+        if not rec_tracks:
+            console.print("[yellow]No recommendations found.[/yellow]")
+            return
+        
+        # Filter out tracks already in playlist
+        existing_uris = set(t['uri'] for t in valid_tracks)
+        new_recs = [t for t in rec_tracks if t['uri'] not in existing_uris]
+        
+        console.print(f"\n[bold green]Found {len(new_recs)} new recommendations:[/bold green]")
+        
+        # Display recommendations with album info for diversity verification
+        for i, track in enumerate(new_recs[:20], 1):
+            artists = ", ".join([a['name'] for a in track['artists']])
+            album = track['album']['name']
+            console.print(f"  {i:>2}. [magenta]{track['name']}[/magenta] - [green]{artists}[/green]")
+            console.print(f"      [dim]from {album}[/dim]")
+        
+        if len(new_recs) > 20:
+            console.print(f"  ... and {len(new_recs) - 20} more")
+        
+        # Create playlist if we have enough quality recommendations (with confirmation)
+        if len(new_recs) >= 10:
+            playlist_name_safe = playlist_name[:50]  # Limit length
+            rec_playlist_name = target_name if target_name else f"{playlist_name_safe} — Recommendations"
+            
+            if spotifaj_functions.confirm(f"\nCreate playlist '{rec_playlist_name}' with {len(new_recs)} tracks?", default=True):
+                rec_playlist_id = spotifaj_functions.create_playlist(username, rec_playlist_name)
+                if rec_playlist_id:
+                    rec_track_ids = [t['id'] for t in new_recs]
+                    spotifaj_functions.add_song_to_spotify_playlist(username, rec_track_ids, rec_playlist_id)
+                    console.print(f"[bold green]✓ Created playlist '{rec_playlist_name}' with {len(rec_track_ids)} tracks[/bold green]")
+                else:
+                    console.print("[red]✗ Failed to create playlist[/red]")
+            else:
+                console.print("[yellow]Playlist creation cancelled[/yellow]")
+        else:
+            console.print(f"\n[yellow]Not enough recommendations ({len(new_recs)}) to create playlist (min 10 required)[/yellow]")
+        
+    except Exception as e:
+        logger.error(f"Error generating recommendations: {e}")
 
 @spotifaj.command()
 @click.option('--shell', type=click.Choice(['bash', 'zsh', 'fish']), default='zsh', help="Target shell.")
