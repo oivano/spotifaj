@@ -36,33 +36,41 @@ class SQLiteCache:
         self.db_path = Path(db_path)
         self.default_expiry_days = default_expiry_days
         
-        # Create cache directory if it doesn't exist
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure cache directory exists
+        cache_dir = self.db_path.parent
+        if not cache_dir.exists():
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Could not create cache directory {cache_dir}: {e}")
         
         # Initialize database
         self._init_db()
     
     def _init_db(self):
         """Initialize database schema."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    metadata TEXT,
-                    created_at REAL NOT NULL,
-                    expires_at REAL NOT NULL,
-                    version TEXT DEFAULT '2.0'
-                )
-            """)
-            
-            # Create index for expiry lookups
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_expires_at 
-                ON cache(expires_at)
-            """)
-            
-            conn.commit()
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS cache (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        metadata TEXT,
+                        created_at REAL NOT NULL,
+                        expires_at REAL NOT NULL,
+                        version TEXT DEFAULT '2.0'
+                    )
+                """)
+                
+                # Create index for expiry lookups
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_expires_at 
+                    ON cache(expires_at)
+                """)
+                
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to initialize database at {self.db_path}: {e}")
     
     def get(self, key: str) -> Optional[Any]:
         """
@@ -74,7 +82,7 @@ class SQLiteCache:
         Returns:
             Cached value or None if not found/expired
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(str(self.db_path)) as conn:
             cursor = conn.execute(
                 "SELECT value, expires_at FROM cache WHERE key = ?",
                 (key,)
@@ -120,7 +128,7 @@ class SQLiteCache:
             value_json = json.dumps(value)
             metadata_json = json.dumps(metadata) if metadata else None
             
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(str(self.db_path)) as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO cache 
                     (key, value, metadata, created_at, expires_at)
@@ -132,13 +140,13 @@ class SQLiteCache:
     
     def delete(self, key: str):
         """Delete entry from cache."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(str(self.db_path)) as conn:
             conn.execute("DELETE FROM cache WHERE key = ?", (key,))
             conn.commit()
     
     def clear_expired(self):
         """Remove all expired entries from cache."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(str(self.db_path)) as conn:
             cursor = conn.execute(
                 "DELETE FROM cache WHERE expires_at < ?",
                 (time.time(),)
@@ -153,14 +161,14 @@ class SQLiteCache:
     
     def clear_all(self):
         """Clear entire cache."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(str(self.db_path)) as conn:
             conn.execute("DELETE FROM cache")
             conn.commit()
             logger.info("Cleared all cache entries")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(str(self.db_path)) as conn:
             # Total entries
             total = conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
             

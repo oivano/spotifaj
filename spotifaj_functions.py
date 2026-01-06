@@ -7,7 +7,7 @@ import time
 from typing import Optional, List, Dict, Any, Callable, Set, Tuple
 import spotipy
 import spotipy.util as util
-from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
 from config import settings, logger
 from constants import (
     SPOTIFY_MAX_RETRIES,
@@ -43,7 +43,8 @@ DEFAULT_SCOPE = (
     "playlist-read-collaborative "
     "user-library-modify "
     "user-modify-playback-state "
-    "user-library-read"
+    "user-library-read "
+    "ugc-image-upload"
 )
 
 COUNTRY = DEFAULT_COUNTRY_CODE
@@ -83,24 +84,40 @@ def get_spotify_client(username: Optional[str] = None, scope: str = DEFAULT_SCOP
     Otherwise, falls back to Client Credentials (public data only).
     """
     if username:
-        # User Authorization
+        # User Authorization with OAuth (supports automatic token refresh)
         try:
-            token = util.prompt_for_user_token(
-                username,
-                scope,
+            from spotipy.oauth2 import SpotifyOAuth
+            
+            auth_manager = SpotifyOAuth(
                 client_id=settings.spotipy_client_id,
                 client_secret=settings.spotipy_client_secret,
-                redirect_uri=settings.spotipy_redirect_uri
+                redirect_uri=settings.spotipy_redirect_uri,
+                scope=scope,
+                username=username,
+                cache_path=f".cache-{username}"
             )
-            if token:
-                # Disable internal retries to handle them manually and avoid long hangs
-                return spotipy.Spotify(auth=token, requests_timeout=SPOTIFY_REQUEST_TIMEOUT, retries=0)
-            else:
-                logger.error(f"Can't get token for {username}")
-                return None
+            
+            # Disable internal retries to handle them manually and avoid long hangs
+            return spotipy.Spotify(auth_manager=auth_manager, requests_timeout=SPOTIFY_REQUEST_TIMEOUT, retries=0)
         except Exception as e:
-            logger.error(f"Error getting token: {e}")
-            return None
+            logger.error(f"Error creating OAuth client: {e}")
+            # Fallback to old method
+            try:
+                token = util.prompt_for_user_token(
+                    username,
+                    scope,
+                    client_id=settings.spotipy_client_id,
+                    client_secret=settings.spotipy_client_secret,
+                    redirect_uri=settings.spotipy_redirect_uri
+                )
+                if token:
+                    return spotipy.Spotify(auth=token, requests_timeout=SPOTIFY_REQUEST_TIMEOUT, retries=0)
+                else:
+                    logger.error(f"Can't get token for {username}")
+                    return None
+            except Exception as e2:
+                logger.error(f"Error getting token: {e2}")
+                return None
     else:
         # Client Credentials
         client_credentials_manager = SpotifyClientCredentials(
@@ -166,15 +183,58 @@ def show_all_playlists(username: str) -> Optional[Dict[str, Any]]:
     return None
 
 def find_playlist_by_name(username: str, playlist_name: str) -> Optional[str]:
-    """Finds a playlist ID by exact name match for a user."""
+    """
+    Finds a playlist ID by exact name match for a user.
+    Searches through all playlists the user has access to, including Spotify-created ones.
+    """
     sp = get_spotify_client(username=username)
     if not sp:
         return None
     
-    playlists = _spotify_call(lambda: sp.user_playlists(username))
+    # Use current_user_playlists() to get ALL playlists including Spotify-created ones
+    # This works better than user_playlists(username) for finding playlists like "Discover Weekly"
+    try:
+        playlists = _spotify_call(lambda: sp.current_user_playlists())
+    except:
+        # Fallback to user_playlists if current_user fails
+        playlists = _spotify_call(lambda: sp.user_playlists(username))
+    
     while playlists:
         for playlist in playlists['items']:
             if playlist['name'] == playlist_name:
+                return playlist['id']
+        
+        if playlists['next']:
+            playlists = _spotify_call(lambda: sp.next(playlists))
+        else:
+            playlists = None
+    return None
+
+def find_playlist_by_name_fuzzy(username: str, playlist_name: str) -> Optional[str]:
+    """
+    Finds a playlist ID with case-insensitive matching.
+    First tries exact match, then falls back to case-insensitive.
+    """
+    # Try exact match first
+    result = find_playlist_by_name(username, playlist_name)
+    if result:
+        return result
+    
+    # Try case-insensitive match
+    sp = get_spotify_client(username=username)
+    if not sp:
+        return None
+    
+    search_name_lower = playlist_name.lower()
+    
+    try:
+        playlists = _spotify_call(lambda: sp.current_user_playlists())
+    except:
+        playlists = _spotify_call(lambda: sp.user_playlists(username))
+    
+    while playlists:
+        for playlist in playlists['items']:
+            if playlist['name'].lower() == search_name_lower:
                 return playlist['id']
         
         if playlists['next']:
@@ -264,6 +324,266 @@ def remove_song_from_spotify_playlist(username, track_id, playlist_id):
     sp = get_spotify_client(username=username)
     if sp:
         sp.user_playlist_remove_all_occurrences_of_tracks(username, playlist_id, [track_id])
+
+def sync_playlists(username: str, source_playlist_id: str, target_playlist_id: str, 
+                   remove_extra: bool = False, preserve_order: bool = False, 
+                   dry_run: bool = False) -> Dict[str, Any]:
+    """
+    Sync target playlist with source playlist.
+    
+    Args:
+        username: Spotify username
+        source_playlist_id: ID of the source playlist to sync from
+        target_playlist_id: ID of the target playlist to sync to
+        remove_extra: If True, remove tracks from target that aren't in source
+        preserve_order: If True, reorder target to match source order
+        dry_run: If True, only report what would be done without making changes
+    
+    Returns:
+        Dict with keys: 'to_add', 'to_remove', 'source_count', 'target_count'
+    """
+    sp = get_spotify_client(username=username)
+    if not sp:
+        return {'error': 'Failed to initialize Spotify client'}
+    
+    # Fetch source playlist tracks
+    source_tracks = []
+    results = sp.user_playlist_tracks(username, source_playlist_id)
+    while results:
+        for item in results['items']:
+            if item and item['track']:
+                source_tracks.append(item['track'])
+        if results['next']:
+            results = sp.next(results)
+        else:
+            results = None
+    
+    # Fetch target playlist tracks
+    target_tracks = []
+    results = sp.user_playlist_tracks(username, target_playlist_id)
+    while results:
+        for item in results['items']:
+            if item and item['track']:
+                target_tracks.append(item['track'])
+        if results['next']:
+            results = sp.next(results)
+        else:
+            results = None
+    
+    # Create sets of track IDs for comparison
+    source_ids = [t['id'] for t in source_tracks]
+    target_ids = [t['id'] for t in target_tracks]
+    
+    source_id_set = set(source_ids)
+    target_id_set = set(target_ids)
+    
+    # Find tracks to add (in source but not in target)
+    to_add_ids = [tid for tid in source_ids if tid not in target_id_set]
+    
+    # Find tracks to remove (in target but not in source)
+    to_remove_ids = [tid for tid in target_ids if tid not in source_id_set]
+    
+    result = {
+        'source_count': len(source_tracks),
+        'target_count': len(target_tracks),
+        'to_add': to_add_ids,
+        'to_remove': to_remove_ids,
+        'to_add_tracks': [t for t in source_tracks if t['id'] in to_add_ids],
+        'to_remove_tracks': [t for t in target_tracks if t['id'] in to_remove_ids]
+    }
+    
+    if dry_run:
+        return result
+    
+    # Add missing tracks
+    if to_add_ids:
+        logger.info(f"Adding {len(to_add_ids)} tracks to target playlist...")
+        add_song_to_spotify_playlist(username, to_add_ids, target_playlist_id, sp=sp)
+    
+    # Remove extra tracks if requested
+    if remove_extra and to_remove_ids:
+        logger.info(f"Removing {len(to_remove_ids)} extra tracks from target playlist...")
+        for i in range(0, len(to_remove_ids), 100):
+            chunk = to_remove_ids[i:i+100]
+            try:
+                sp.user_playlist_remove_all_occurrences_of_tracks(username, target_playlist_id, chunk)
+            except Exception as e:
+                logger.error(f"Error removing tracks: {e}")
+    
+    # Reorder if requested and if tracks match
+    if preserve_order and not to_add_ids and not (remove_extra and to_remove_ids):
+        # Only reorder if playlists have same tracks (just in different order)
+        if source_id_set == target_id_set:
+            logger.info("Reordering target playlist to match source...")
+            # Replace all tracks in the same order as source
+            try:
+                # Clear target playlist
+                sp.user_playlist_replace_tracks(username, target_playlist_id, [])
+                # Add all tracks in source order
+                add_song_to_spotify_playlist(username, source_ids, target_playlist_id, sp=sp)
+            except Exception as e:
+                logger.error(f"Error reordering playlist: {e}")
+    
+    return result
+
+def copy_missing_tracks_with_dedup(username: str, source_playlist_id: str, target_playlist_id: str,
+                                   keep_best: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
+    """
+    Copy missing tracks from source to target playlist and deduplicate the target.
+    
+    Args:
+        username: Spotify username
+        source_playlist_id: ID of the source playlist to copy from
+        target_playlist_id: ID of the target playlist to copy to
+        keep_best: Deduplication strategy ('popularity', 'explicit', 'clean', 'longest', 'shortest')
+        dry_run: If True, only report what would be done without making changes
+    
+    Returns:
+        Dict with keys: 'added_count', 'duplicates_removed', 'source_count', 'target_count_before', 'target_count_after'
+    """
+    sp = get_spotify_client(username=username)
+    if not sp:
+        return {'error': 'Failed to initialize Spotify client'}
+    
+    # Fetch source playlist tracks
+    source_tracks = []
+    results = sp.user_playlist_tracks(username, source_playlist_id)
+    while results:
+        for item in results['items']:
+            if item and item['track']:
+                source_tracks.append(item['track'])
+        if results['next']:
+            results = sp.next(results)
+        else:
+            results = None
+    
+    # Fetch target playlist tracks (before adding)
+    target_tracks_before = []
+    results = sp.user_playlist_tracks(username, target_playlist_id)
+    while results:
+        for item in results['items']:
+            if item and item['track']:
+                target_tracks_before.append(item['track'])
+        if results['next']:
+            results = sp.next(results)
+        else:
+            results = None
+    
+    # Find tracks to add (by ID and signature to avoid duplicates)
+    target_ids = set(t['id'] for t in target_tracks_before)
+    target_signatures = set(create_track_signature(t) for t in target_tracks_before)
+    
+    to_add = []
+    for track in source_tracks:
+        # Check both ID and signature to avoid all types of duplicates
+        if track['id'] not in target_ids:
+            sig = create_track_signature(track)
+            if sig not in target_signatures:
+                to_add.append(track)
+                # Add to sets to prevent duplicates within the batch
+                target_ids.add(track['id'])
+                target_signatures.add(sig)
+    
+    result = {
+        'source_count': len(source_tracks),
+        'target_count_before': len(target_tracks_before),
+        'to_add': [t['id'] for t in to_add],
+        'to_add_tracks': to_add,
+        'duplicates_removed': 0,
+        'target_count_after': len(target_tracks_before) + len(to_add)
+    }
+    
+    if dry_run:
+        # In dry run, estimate duplicates that would be found
+        # Don't actually scan since we're not making changes
+        return result
+    
+    # Add missing tracks
+    if to_add:
+        logger.info(f"Adding {len(to_add)} new tracks to target playlist...")
+        to_add_ids = [t['id'] for t in to_add]
+        add_song_to_spotify_playlist(username, to_add_ids, target_playlist_id, sp=sp)
+    
+    # Run deduplication on target playlist
+    logger.info("Scanning for duplicates in target playlist...")
+    duplicates = find_duplicates_in_playlist(username, target_playlist_id)
+    
+    if duplicates:
+        logger.info(f"Found {len(duplicates)} duplicates.")
+        
+        # Apply keep-best logic if specified
+        if keep_best:
+            from collections import defaultdict
+            dup_groups = defaultdict(list)
+            
+            for d in duplicates:
+                orig = d['original']
+                sig = create_track_signature(orig)
+                dup_groups[sig].append(d)
+            
+            refined_duplicates = []
+            
+            for sig, group in dup_groups.items():
+                # Get all versions (original + duplicates)
+                all_versions = [g['original'] for g in group] + [g['duplicate'] for g in group]
+                
+                # Deduplicate by URI
+                unique_versions = {}
+                for v in all_versions:
+                    unique_versions[v['uri']] = v
+                
+                versions = list(unique_versions.values())
+                
+                if len(versions) < 2:
+                    continue
+                
+                # Select best based on criteria
+                if keep_best == 'popularity':
+                    best = max(versions, key=lambda t: t.get('popularity', 0))
+                elif keep_best == 'explicit':
+                    explicit_versions = [v for v in versions if v.get('explicit', False)]
+                    if explicit_versions:
+                        best = max(explicit_versions, key=lambda t: t.get('popularity', 0))
+                    else:
+                        best = max(versions, key=lambda t: t.get('popularity', 0))
+                elif keep_best == 'clean':
+                    clean_versions = [v for v in versions if not v.get('explicit', False)]
+                    if clean_versions:
+                        best = max(clean_versions, key=lambda t: t.get('popularity', 0))
+                    else:
+                        best = max(versions, key=lambda t: t.get('popularity', 0))
+                elif keep_best == 'longest':
+                    best = max(versions, key=lambda t: t.get('duration_ms', 0))
+                elif keep_best == 'shortest':
+                    best = min(versions, key=lambda t: t.get('duration_ms', float('inf')))
+                else:
+                    best = versions[0]
+                
+                # Mark all other versions as duplicates to remove
+                for g in group:
+                    if g['duplicate']['uri'] != best['uri']:
+                        refined_duplicates.append(g)
+            
+            duplicates = refined_duplicates
+        
+        # Remove duplicates
+        if duplicates:
+            logger.info(f"Removing {len(duplicates)} duplicates...")
+            removal_map = {}  # uri -> list of positions
+            for d in duplicates:
+                uri = d['duplicate']['uri']
+                pos = d['position']
+                if uri not in removal_map:
+                    removal_map[uri] = []
+                removal_map[uri].append(pos)
+            
+            tracks_to_remove = [{'uri': uri, 'positions': positions} for uri, positions in removal_map.items()]
+            remove_specific_occurrences(username, target_playlist_id, tracks_to_remove)
+            
+            result['duplicates_removed'] = len(duplicates)
+            result['target_count_after'] = result['target_count_after'] - len(duplicates)
+    
+    return result
 
 def get_artist_info(sp, artist_spotify_id):
     """Returns all artist data: albums, songs, etc."""
@@ -733,13 +1053,23 @@ def validate_tracks_list(sp, tracks, target_label, selection=None, auto_mode=Fal
     return tracks_to_keep
 
 def fetch_all_user_playlists(username):
-    """Fetches ALL playlists for a user (handling pagination)."""
+    """
+    Fetches ALL playlists for a user (handling pagination).
+    Includes both user-created and Spotify-created playlists (like Discover Weekly).
+    """
     sp = get_spotify_client(username=username)
     if not sp:
         return []
     
     playlists = []
-    results = sp.user_playlists(username)
+    
+    # Try current_user_playlists first (gets all playlists including Spotify-created)
+    try:
+        results = sp.current_user_playlists()
+    except:
+        # Fallback to user_playlists if current_user fails
+        results = sp.user_playlists(username)
+    
     while results:
         playlists.extend(results['items'])
         if results['next']:

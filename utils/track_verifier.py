@@ -16,6 +16,9 @@ class TrackVerifier:
         self.sp = spotify_client
         self.logger = logging.getLogger('track_verifier')
         self.cache_manager = cache_manager
+        # Album cache to prevent duplicate API calls when verifying many tracks
+        # Typical scenario: 1194 tracks might share only ~150 unique albums
+        self.album_cache = {}
         
     def calculate_track_confidence(self, track, label_name, base_confidence=50):
         """Calculate confidence that a track belongs to a specific label."""
@@ -38,7 +41,16 @@ class TrackVerifier:
         # If we have an album ID, get detailed album info including copyrights
         if album_id:
             try:
-                album = self.sp.album(album_id)  # Use self.sp, not self.spotify_client
+                # CRITICAL FIX: Check cache first to avoid duplicate API calls
+                if album_id in self.album_cache:
+                    album = self.album_cache[album_id]
+                else:
+                    # CRITICAL FIX: Use _spotify_call() wrapper for rate limiting
+                    from spotifaj_functions import _spotify_call
+                    album = _spotify_call(lambda: self.sp.album(album_id))
+                    if album:
+                        # Cache the album to prevent duplicate lookups
+                        self.album_cache[album_id] = album
                 
                 # 1. Check copyright information (strongest indicator)
                 copyright_match = self._check_copyright_for_label(album, label_name)
@@ -46,6 +58,16 @@ class TrackVerifier:
                     confidence += 40  # Major boost for exact copyright match
                 elif copyright_match == 'partial':
                     confidence += 20  # Good boost for partial match
+                
+                # 1b. Check album label field (critical for filtering false positives)
+                album_label = album.get('label', '').lower()
+                if album_label:
+                    if album_label == label_lower:
+                        confidence += 30  # Exact label match
+                    elif album_label.startswith(label_lower + ' ') or album_label.startswith(label_lower + '-'):
+                        confidence += 25  # Prefix match (e.g., "Warp" matches "Warp Records")
+                    elif label_lower in album_label:
+                        confidence += 10  # Substring match
                     
                 # 2. Check artist-label association (if artist ID is available)
                 artist_id = track.get('artists', [{}])[0].get('id')
@@ -194,3 +216,17 @@ class TrackVerifier:
         if not hasattr(self, 'label_keywords'):
             self.label_keywords = {}
         self.label_keywords[label_name] = keywords
+    
+    def clear_album_cache(self):
+        """Clear the album cache (useful between different label verifications)."""
+        cache_size = len(self.album_cache)
+        self.album_cache = {}
+        if cache_size > 0:
+            logger.debug(f"Cleared album cache ({cache_size} albums)")
+    
+    def get_cache_stats(self):
+        """Return statistics about album cache usage."""
+        return {
+            'cached_albums': len(self.album_cache),
+            'cache_size_mb': len(str(self.album_cache)) / (1024 * 1024)
+        }

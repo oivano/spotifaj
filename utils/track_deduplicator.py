@@ -6,6 +6,9 @@ Handles deduplication of tracks using intelligent comparison.
 import logging
 import re
 
+# Import centralized Spotify API wrapper with retry/backoff
+from spotifaj_functions import _spotify_call
+
 logger = logging.getLogger('track_deduplicator')
 
 def generate_track_signature(track):
@@ -70,7 +73,8 @@ def deduplicate_tracks(spotify_client, track_ids, display_progress=False, progre
             for i in range(0, len(unique_ids), batch_size):
                 batch = unique_ids[i:i+batch_size]
                 try:
-                    batch_info = spotify_client.tracks(batch)
+                    # Use centralized _spotify_call with proper retry/backoff for 429 errors
+                    batch_info = _spotify_call(lambda: spotify_client.tracks(batch))
                     if batch_info and 'tracks' in batch_info:
                         tracks_info.extend(batch_info['tracks'])
                 except Exception as e:

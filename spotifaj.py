@@ -10,6 +10,7 @@ import re
 import time
 import base64
 import requests
+import spotipy
 from io import BytesIO
 from difflib import SequenceMatcher
 from rich.console import Console
@@ -39,14 +40,14 @@ from fuzzywuzzy import fuzz
 # Import new modules
 try:
     from workflows.discogs_workflow import DiscogsLabelWorkflow
-    from workflows.spotify_workflow import SpotifyLabelWorkflow
     from clients.discogs_client import get_discogs_client
     from utils.cache_manager import CacheManager
     from utils.track_deduplicator import deduplicate_tracks, generate_track_signature
+    from utils.track_confidence_scorer import TrackConfidenceScorer
 except ImportError as e:
     logger.warning(f"Could not import advanced modules: {e}")
     DiscogsLabelWorkflow = None
-    SpotifyLabelWorkflow = None
+    TrackConfidenceScorer = None
 
 console = Console()
 __version__ = "0.0.3"
@@ -64,7 +65,9 @@ def spotifaj():
 @click.option('--exhaustive', is_flag=True, help="Perform an exhaustive search by year (slower, but finds >1000 tracks).")
 @click.option('--year', help="Search for tracks in a specific year, range (YYYY-YYYY), or 'all' for exhaustive search.")
 @click.option('--validate', is_flag=True, help="Validate playlist tracks after creation.")
-def search_label(label, username, playlist, exhaustive, year, validate):
+@click.option('--min-confidence', default=70, type=int, help="Minimum confidence score (0-100) for automatic verification. Default: 70")
+@click.option('--no-verify', is_flag=True, help="Skip automatic confidence verification (faster but less accurate).")
+def search_label(label, username, playlist, exhaustive, year, validate, min_confidence, no_verify):
     """Search for tracks by label and optionally add to a playlist."""
     
     if year and str(year).lower() == 'all':
@@ -75,7 +78,7 @@ def search_label(label, username, playlist, exhaustive, year, validate):
     if year:
         playlist_name = f"{playlist_name} ({year})"
     
-    sp = spotifaj_functions.get_spotify_client()
+    sp = spotifaj_functions.get_spotify_client(username=username)
     if not sp:
         logger.error("Failed to initialize Spotify client.")
         sys.exit(1)
@@ -132,6 +135,37 @@ def search_label(label, username, playlist, exhaustive, year, validate):
     if total_tracks == 0:
         logger.info("No tracks found.")
         return
+    
+    # Automatic confidence verification (unless disabled)
+    if not no_verify and total_tracks > 0 and TrackConfidenceScorer:
+        logger.info(f"Verifying tracks with confidence threshold {min_confidence}...")
+        try:
+            scorer = TrackConfidenceScorer(sp, label)
+            verified_tracks, filtered_count = scorer.score_tracks_batch(
+                found_tracks, 
+                base_confidence=40,
+                min_threshold=min_confidence
+            )
+            
+            if filtered_count > 0:
+                logger.info(f"Filtered {filtered_count} low-confidence tracks (kept {len(verified_tracks)}/{total_tracks})")
+                found_tracks = verified_tracks
+                total_tracks = len(found_tracks)
+                
+                if total_tracks == 0:
+                    logger.warning("All tracks filtered out. Try lowering --min-confidence or use --no-verify.")
+                    return
+            else:
+                logger.info("All tracks passed confidence verification.")
+            
+            # Show cache stats if debug enabled
+            stats = scorer.get_cache_stats()
+            if stats['cached_albums'] > 0:
+                logger.debug(f"Album cache: {stats['cached_albums']} albums cached")
+        except Exception as e:
+            logger.warning(f"Confidence verification failed: {e}. Proceeding with unverified tracks.")
+    elif no_verify:
+        logger.info("Skipping automatic verification (--no-verify enabled)")
     
     if not exhaustive and not year:
         if total_tracks >= 1000:
@@ -231,9 +265,10 @@ def search_label(label, username, playlist, exhaustive, year, validate):
 @spotifaj.command()
 @click.argument('label')
 @click.option('--username', default=settings.spotipy_username, help="Spotify username.")
+@click.option('--playlist', help="Playlist name (defaults to '<label> - Discogs Verified').")
 @click.option('--strictness', type=click.Choice(['loose', 'normal', 'strict']), default='normal', help="Verification strictness.")
 @click.option('--force-update', is_flag=True, help="Force update cache.")
-def discogs_label(label, username, strictness, force_update):
+def discogs_label(label, username, playlist, strictness, force_update):
     """Search for tracks by label using Discogs as source of truth."""
     if not DiscogsLabelWorkflow:
         logger.error("Discogs modules not loaded. Check dependencies.")
@@ -264,63 +299,59 @@ def discogs_label(label, username, strictness, force_update):
         )
         
         if track_ids:
-            if spotifaj_functions.confirm(f"Found {len(track_ids)} verified tracks. Create playlist?"):
-                workflow.create_label_playlist(track_ids, discogs_label.name)
+            # Determine playlist name
+            if playlist:
+                playlist_name = playlist
+            else:
+                # Check for both naming patterns: just label name, and label + suffix
+                playlist_name_simple = discogs_label.name
+                playlist_name_verified = f"{discogs_label.name} - Discogs Verified"
+                
+                # Check both patterns
+                existing_simple = spotifaj_functions.find_playlist_by_name(username, playlist_name_simple)
+                existing_verified = spotifaj_functions.find_playlist_by_name(username, playlist_name_verified)
+                
+                if existing_simple and not existing_verified:
+                    playlist_name = playlist_name_simple
+                    existing_playlist_id = existing_simple
+                elif existing_verified:
+                    playlist_name = playlist_name_verified
+                    existing_playlist_id = existing_verified
+                else:
+                    # Neither exists, use verified naming
+                    playlist_name = playlist_name_verified
+                    existing_playlist_id = None
+            
+            # If we haven't checked yet, do it now
+            if not playlist:
+                if 'existing_playlist_id' not in locals():
+                    existing_playlist_id = spotifaj_functions.find_playlist_by_name(username, playlist_name)
+            else:
+                existing_playlist_id = spotifaj_functions.find_playlist_by_name(username, playlist_name)
+            
+            if existing_playlist_id:
+                # Playlist exists - check for new tracks
+                existing_track_ids = spotifaj_functions.get_playlist_track_ids(username, existing_playlist_id)
+                new_tracks = [tid for tid in track_ids if tid not in existing_track_ids]
+                
+                if new_tracks:
+                    if spotifaj_functions.confirm(f"Playlist '{playlist_name}' exists with {len(existing_track_ids)} tracks. Add {len(new_tracks)} new tracks?", default=False):
+                        workflow.create_label_playlist(track_ids, discogs_label.name, playlist_name=playlist_name)
+                    else:
+                        logger.info("Skipped updating playlist")
+                else:
+                    logger.info(f"All {len(track_ids)} tracks already in playlist '{playlist_name}'. No new tracks to add.")
+            else:
+                # No existing playlist - ask to create
+                if spotifaj_functions.confirm(f"Found {len(track_ids)} verified tracks. Create playlist '{playlist_name}'?", default=True):
+                    workflow.create_label_playlist(track_ids, discogs_label.name, playlist_name=playlist_name)
+                else:
+                    logger.info("Skipped creating playlist")
         else:
             logger.info("No tracks found.")
             
     except Exception as e:
         logger.error(f"Error in Discogs workflow: {e}")
-
-@spotifaj.command()
-@click.argument('label')
-@click.option('--year', help="Year(s) to search. 'all', 'YYYY', or 'YYYY-YYYY'. Default: current year.")
-@click.option('--playlist', help="Name of playlist to create.")
-@click.option('--no-cache', is_flag=True, help="Disable caching.")
-def spotify_label(label, year, playlist, no_cache):
-    """
-    Advanced Spotify label search with confidence scoring.
-    
-    Uses multiple search strategies (High/Medium/Low confidence) to find tracks
-    associated with a label, verifies them against metadata, and deduplicates results.
-    """
-    if not SpotifyLabelWorkflow:
-        console.print("[red]Error: Advanced modules not available.[/red]")
-        return
-
-    sp = spotifaj_functions.get_spotify_client()
-    if not sp:
-        return
-
-    workflow = SpotifyLabelWorkflow(sp)
-    
-    # Parse year input for the workflow
-    from datetime import datetime
-    year_input = '1' if str(year).lower() == 'all' else (year if year else str(datetime.now().year))
-    
-    console.print(f"[bold green]Starting advanced search for label: {label}[/bold green]")
-    if year:
-        console.print(f"Year range: {year}")
-
-    try:
-        track_ids = workflow.get_label_tracks(
-            label, 
-            year_input=year_input,
-            use_cache=not no_cache
-        )
-        
-        if track_ids:
-            console.print(f"[green]Found {len(track_ids)} verified tracks.[/green]")
-            if click.confirm(f"Create playlist with {len(track_ids)} tracks?", default=True):
-                pl_id = workflow.create_label_playlist(label, track_ids, playlist_name=playlist)
-                if pl_id:
-                    console.print(f"[bold green]Playlist created successfully![/bold green]")
-        else:
-            console.print("[yellow]No tracks found matching criteria.[/yellow]")
-            
-    except Exception as e:
-        console.print(f"[red]Error running workflow: {e}[/red]")
-        logger.exception("Workflow failed")
 
 @spotifaj.command()
 @click.argument('username')
@@ -1178,8 +1209,10 @@ def normalize_text_for_matching(text):
     if '|' in text:
         text = text.split('|')[0].strip()
     
-    # Normalize all dash types and separators to space
-    text = re.sub(r'[-–—―‐‑‒−/|]', ' ', text)
+    # Normalize all dash types, separators, and "vs"/"v" to space
+    # This makes "theorem vs. swayzak" match "theorem, swayzak"
+    text = re.sub(r'\s+vs\.?\s+|\s+v\.?\s+', ' ', text, flags=re.IGNORECASE)  # "vs." or "v." -> space
+    text = re.sub(r'[-–—―‐‑‒−/|,]', ' ', text)  # dashes, slashes, commas -> space
     
     # Collapse multiple spaces to single space
     text = re.sub(r'\s+', ' ', text).strip()
@@ -1208,6 +1241,14 @@ def parse_track_input(line):
     # Just clean up the pipe content first
     if '|' in line:
         line = line.split('|')[0].strip()
+    
+    # Check for format: Artist "Track Name" (Label)
+    quoted_match = re.match(r'^([^"]+?)\s+"([^"]+)"\s*(?:\([^)]+\))?', line)
+    if quoted_match:
+        artist_part = quoted_match.group(1).strip()
+        track = quoted_match.group(2).strip()
+        primary_artist, all_artists = normalize_artist_string(artist_part)
+        return primary_artist, track, all_artists
     
     # Remove common metadata patterns in parentheses
     # Examples: (taken from Album, Year), (Album Version), (feat. Artist), etc.
@@ -1304,6 +1345,8 @@ def calculate_match_confidence(search_result, expected_artist, expected_track, e
             r'\s*remaster.*$',
             r'\s*remix.*$',
             r'\s*\d{4}\s+remaster.*$',
+            r'\s+minus$',  # Trailing "minus" (version indicator)
+            r'\s+plus$',   # Trailing "plus" (version indicator)
         ]
         for suffix in suffixes:
             track = re.sub(suffix, '', track, flags=re.IGNORECASE)
@@ -1480,6 +1523,24 @@ def import_playlist(input_file, name, username, yes, url):
         logger.error("Failed to initialize Spotify client.")
         sys.exit(1)
 
+    # Helper function to handle API calls with automatic token refresh
+    def safe_search(query, limit=50, max_retries=3):
+        """Perform a search with automatic token refresh on 401 errors."""
+        for attempt in range(max_retries):
+            try:
+                return sp.search(q=query, limit=limit, type='track')
+            except spotipy.exceptions.SpotifyException as e:
+                if e.http_status == 401 and attempt < max_retries - 1:
+                    # Token expired - the auth_manager should auto-refresh on next call
+                    logger.warning(f"Token expired during search, retrying... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(1)
+                    continue
+                else:
+                    raise
+            except Exception as e:
+                raise
+        return None
+
     track_uris = []
     not_found = []
     low_confidence_matches = []
@@ -1564,6 +1625,19 @@ def import_playlist(input_file, name, username, yes, url):
                     text = re.sub(r'\s+', ' ', text).strip()
                     return text
                 
+                # Add fuzzy search variant for common typos
+                def create_fuzzy_variants(text):
+                    """Create search variants for common typos."""
+                    variants = [text]
+                    
+                    # Common misspellings: y <-> i (Rythym vs Rhythm)
+                    if 'y' in text.lower():
+                        variants.append(re.sub(r'y', 'i', text, flags=re.IGNORECASE))
+                    if 'i' in text.lower():
+                        variants.append(re.sub(r'i', 'y', text, flags=re.IGNORECASE))
+                    
+                    return list(set(variants))  # Remove duplicates
+                
                 # Try multiple search strategies for better results
                 search_queries = []
                 
@@ -1575,7 +1649,13 @@ def import_playlist(input_file, name, username, yes, url):
                     # Strategy 1: Simple artist + track (flexible, works for most cases)
                     search_queries.append(f"{artist_norm} {track_norm}")
                     
-                    # Strategy 2: Track name only (fallback for rare/misspelled artists)
+                    # Strategy 2: Add fuzzy variants for track name to catch typos
+                    track_variants = create_fuzzy_variants(track_norm)
+                    for variant in track_variants:
+                        if variant != track_norm:  # Don't duplicate the original
+                            search_queries.append(f"{artist_norm} {variant}")
+                    
+                    # Strategy 3: Track name only (fallback for rare/misspelled artists)
                     search_queries.append(f"{track_norm}")
                 else:
                     # Fallback: search the whole line (normalized)
@@ -1587,13 +1667,16 @@ def import_playlist(input_file, name, username, yes, url):
                 
                 for search_query in search_queries:
                     try:
-                        results = sp.search(q=search_query, limit=25, type='track')
-                        items = results['tracks']['items']
-                        # Deduplicate by URI
-                        for item in items:
-                            if item['uri'] not in seen_uris:
-                                all_items.append(item)
-                                seen_uris.add(item['uri'])
+                        # Increase limit to 50 to catch more variations/remixes
+                        # Use safe_search to handle token expiration
+                        results = safe_search(search_query, limit=50)
+                        if results:
+                            items = results['tracks']['items']
+                            # Deduplicate by URI
+                            for item in items:
+                                if item['uri'] not in seen_uris:
+                                    all_items.append(item)
+                                    seen_uris.add(item['uri'])
                     except Exception as search_err:
                         logger.debug(f"Search query '{search_query}' failed: {search_err}")
                         continue
@@ -1682,7 +1765,7 @@ def import_playlist(input_file, name, username, yes, url):
             
             # Offer to add cover image
             if spotifaj_functions.confirm("\nWould you like to add a cover image?", default=False):
-                image_url = click.prompt("Enter image URL (JPEG)", type=str)
+                image_url = click.prompt("Enter image URL (JPEG/PNG)", type=str)
                 try:
                     upload_playlist_cover(sp, playlist_id, image_url)
                     console.print("[green]Cover image uploaded successfully![/green]")
@@ -2130,10 +2213,12 @@ def _auto_update_single(sp, tracker, label, username, playlist_name, playlist_id
     
     try:
         query = f'label:"{label}"'
-        found_tracks = []
+        candidate_tracks = []
         offset = 0
         limit = 50
+        label_lower = label.lower()
         
+        # First pass: collect candidate tracks with recent release dates
         while True:
             results = sp.search(q=query, type='track', limit=limit, offset=offset, market='US')
             items = results['tracks']['items']
@@ -2144,7 +2229,7 @@ def _auto_update_single(sp, tracker, label, username, playlist_name, playlist_id
             for track in items:
                 release_date = track['album'].get('release_date', '')
                 if release_date >= last_date:
-                    found_tracks.append(track)
+                    candidate_tracks.append(track)
             
             if len(items) < limit:
                 break
@@ -2152,6 +2237,34 @@ def _auto_update_single(sp, tracker, label, username, playlist_name, playlist_id
             offset += limit
             if offset >= 1000:
                 break
+        
+        # Second pass: verify label field by fetching full album details
+        found_tracks = []
+        if candidate_tracks:
+            # Get unique album IDs
+            album_ids = list(set(track['album']['id'] for track in candidate_tracks))
+            
+            # Fetch album details in batches of 20 (Spotify API limit)
+            album_labels = {}
+            for i in range(0, len(album_ids), 20):
+                batch = album_ids[i:i+20]
+                albums_data = sp.albums(batch)
+                if albums_data and 'albums' in albums_data:
+                    for album in albums_data['albums']:
+                        if album:
+                            album_labels[album['id']] = album.get('label', '').lower()
+            
+            # Filter tracks by label field
+            for track in candidate_tracks:
+                album_id = track['album']['id']
+                album_label = album_labels.get(album_id, '').lower()
+                
+                # Only accept if label field actually matches
+                if (album_label == label_lower or 
+                    album_label.startswith(label_lower + ' ') or
+                    album_label.startswith(label_lower + '-') or
+                    label_lower in album_label):
+                    found_tracks.append(track)
         
         found_tracks.sort(key=lambda t: t['album'].get('release_date', ''), reverse=True)
         
@@ -2530,6 +2643,369 @@ def install_completion(shell):
                 console.print(f"[red]Failed to write to {rc_file}: {e}[/red]")
     else:
         console.print(f"For fish, run:\n    {cmd}")
+
+@spotifaj.command()
+@click.argument('source_playlist')
+@click.argument('target_playlist')
+@click.option('--username', default=settings.spotipy_username, help="Spotify username.")
+@click.option('--remove-extra', is_flag=True, help="Remove tracks from target that aren't in source.")
+@click.option('--preserve-order', is_flag=True, help="Reorder target to match source order (only if tracks are identical).")
+@click.option('--dry-run', is_flag=True, help="Show what would be done without making changes.")
+def sync_playlist(source_playlist, target_playlist, username, remove_extra, preserve_order, dry_run):
+    """
+    Sync target playlist with source playlist.
+    
+    Makes the target playlist match the source playlist by adding missing tracks.
+    Optionally removes extra tracks and preserves order.
+    
+    Examples:
+      # Add missing tracks from source to target
+      spotifaj sync-playlist "Source Playlist" "Target Playlist"
+      
+      # Make target exactly match source (add + remove)
+      spotifaj sync-playlist "Master" "Backup" --remove-extra
+      
+      # Preview changes without making them
+      spotifaj sync-playlist "Source" "Target" --dry-run
+      
+      # Match both content and order
+      spotifaj sync-playlist "Source" "Target" --remove-extra --preserve-order
+    """
+    sp = spotifaj_functions.get_spotify_client(username=username)
+    if not sp:
+        logger.error("Failed to initialize Spotify client.")
+        sys.exit(1)
+    
+    # Resolve source playlist ID
+    source_id = None
+    match = re.search(r'playlist/([a-zA-Z0-9]+)', source_playlist)
+    if match:
+        source_id = match.group(1)
+    elif re.match(r'^[a-zA-Z0-9]{22}$', source_playlist):
+        source_id = source_playlist
+    else:
+        # Try exact match first, then fuzzy match
+        source_id = spotifaj_functions.find_playlist_by_name_fuzzy(username, source_playlist)
+    
+    if not source_id:
+        logger.error(f"Could not find source playlist: {source_playlist}")
+        console.print("\n[red]Error:[/red] Could not find source playlist: {source_playlist}")
+        console.print("\n[yellow]Note:[/yellow] If this is a Spotify-curated playlist (Discover Weekly, Release Radar, etc.):")
+        console.print("       These are [bold]completely inaccessible[/bold] to apps without 'extended quota mode'.")
+        console.print("       See SPOTIFY_PLAYLIST_RESTRICTIONS.md for details and workarounds.")
+        sys.exit(1)
+    
+    # Resolve target playlist ID
+    target_id = None
+    match = re.search(r'playlist/([a-zA-Z0-9]+)', target_playlist)
+    if match:
+        target_id = match.group(1)
+    elif re.match(r'^[a-zA-Z0-9]{22}$', target_playlist):
+        target_id = target_playlist
+    else:
+        # Try exact match first, then fuzzy match
+        target_id = spotifaj_functions.find_playlist_by_name_fuzzy(username, target_playlist)
+    
+    if not target_id:
+        logger.error(f"Could not find target playlist: {target_playlist}")
+        console.print("\n[red]Error:[/red] Could not find target playlist: {target_playlist}")
+        console.print("\n[yellow]Note:[/yellow] If this is a Spotify-curated playlist (Discover Weekly, Release Radar, etc.):")
+        console.print("       These are [bold]completely inaccessible[/bold] to apps without 'extended quota mode'.")
+        console.print("       See SPOTIFY_PLAYLIST_RESTRICTIONS.md for details and workarounds.")
+        sys.exit(1)
+    
+    # Get playlist names for display
+    try:
+        source_info = sp.playlist(source_id)
+        target_info = sp.playlist(target_id)
+        source_name = source_info['name']
+        target_name = target_info['name']
+    except Exception as e:
+        logger.error(f"Error fetching playlist info: {e}")
+        if "404" in str(e) or "not found" in str(e).lower():
+            console.print("\n[red]Error:[/red] Spotify returned 404 (Not Found) for one of the playlists.")
+            console.print("\n[yellow]This usually means:[/yellow]")
+            console.print("  • The playlist is Spotify-curated (Discover Weekly, Release Radar, etc.)")
+            console.print("  • Your app lacks 'extended quota mode' to access it")
+            console.print("  • See [cyan]SPOTIFY_PLAYLIST_RESTRICTIONS.md[/cyan] for solutions")
+        sys.exit(1)
+    
+    console.print(f"\n[bold cyan]Syncing playlists:[/bold cyan]")
+    console.print(f"  Source: [green]{source_name}[/green]")
+    console.print(f"  Target: [yellow]{target_name}[/yellow]")
+    console.print()
+    
+    # Perform sync
+    result = spotifaj_functions.sync_playlists(
+        username=username,
+        source_playlist_id=source_id,
+        target_playlist_id=target_id,
+        remove_extra=remove_extra,
+        preserve_order=preserve_order,
+        dry_run=True  # Always dry run first to show changes
+    )
+    
+    if 'error' in result:
+        logger.error(result['error'])
+        sys.exit(1)
+    
+    # Display summary
+    console.print(f"[bold]Summary:[/bold]")
+    console.print(f"  Source tracks: [cyan]{result['source_count']}[/cyan]")
+    console.print(f"  Target tracks: [cyan]{result['target_count']}[/cyan]")
+    console.print()
+    
+    to_add = result['to_add']
+    to_remove = result['to_remove']
+    
+    if to_add:
+        console.print(f"[green]Tracks to add ({len(to_add)}):[/green]")
+        for track in result['to_add_tracks'][:10]:  # Show first 10
+            artists = ", ".join([a['name'] for a in track['artists']])
+            console.print(f"  + {artists} - {track['name']}")
+        if len(to_add) > 10:
+            console.print(f"  ... and {len(to_add) - 10} more")
+        console.print()
+    
+    if to_remove:
+        if remove_extra:
+            console.print(f"[red]Tracks to remove ({len(to_remove)}):[/red]")
+            for track in result['to_remove_tracks'][:10]:  # Show first 10
+                artists = ", ".join([a['name'] for a in track['artists']])
+                console.print(f"  - {artists} - {track['name']}")
+            if len(to_remove) > 10:
+                console.print(f"  ... and {len(to_remove) - 10} more")
+            console.print()
+        else:
+            console.print(f"[yellow]Target has {len(to_remove)} extra tracks (use --remove-extra to remove them)[/yellow]")
+            console.print()
+    
+    if not to_add and not to_remove:
+        console.print("[bold green]✓ Playlists are already in sync![/bold green]")
+        if preserve_order:
+            console.print("[dim]Order synchronization not checked in dry-run mode.[/dim]")
+        return
+    
+    if dry_run:
+        console.print("[bold yellow]Dry run complete. Use without --dry-run to apply changes.[/bold yellow]")
+        return
+    
+    # Confirm and apply changes
+    action_desc = "add missing tracks"
+    if remove_extra and to_remove:
+        action_desc = f"add {len(to_add)} tracks and remove {len(to_remove)} tracks"
+    elif to_add:
+        action_desc = f"add {len(to_add)} tracks"
+    
+    if spotifaj_functions.confirm(f"\nProceed to {action_desc}?", default=True):
+        # Actually perform the sync
+        result = spotifaj_functions.sync_playlists(
+            username=username,
+            source_playlist_id=source_id,
+            target_playlist_id=target_id,
+            remove_extra=remove_extra,
+            preserve_order=preserve_order,
+            dry_run=False
+        )
+        
+        console.print(f"\n[bold green]✓ Successfully synced '{target_name}' with '{source_name}'![/bold green]")
+        
+        if to_add:
+            console.print(f"  Added: [green]{len(to_add)}[/green] tracks")
+        if remove_extra and to_remove:
+            console.print(f"  Removed: [red]{len(to_remove)}[/red] tracks")
+    else:
+        console.print("[yellow]Sync cancelled.[/yellow]")
+
+@spotifaj.command()
+@click.argument('source_playlist')
+@click.argument('target_playlist')
+@click.option('--username', default=settings.spotipy_username, help="Spotify username.")
+@click.option('--keep-best', type=click.Choice(['popularity', 'explicit', 'clean', 'longest', 'shortest']), 
+              help="When removing duplicates, keep the best version based on criteria.")
+@click.option('--dry-run', is_flag=True, help="Show what would be done without making changes.")
+def merge_playlists(source_playlist, target_playlist, username, keep_best, dry_run):
+    """
+    Copy missing tracks from source to target playlist and deduplicate.
+    
+    This is a one-way merge operation that:
+    1. Adds tracks from source that aren't in target (by ID and metadata)
+    2. Removes any duplicates from the target playlist
+    3. Never removes tracks that were already in target
+    
+    Examples:
+      # Simple merge
+      spotifaj merge-playlists "Source" "Target"
+      
+      # Merge and keep most popular versions when deduplicating
+      spotifaj merge-playlists "Source" "Target" --keep-best popularity
+      
+      # Preview changes
+      spotifaj merge-playlists "Source" "Target" --dry-run
+    
+    Keep-best options:
+      popularity: Keep the most popular version
+      explicit: Prefer explicit versions
+      clean: Prefer clean (non-explicit) versions
+      longest: Keep the longest version
+      shortest: Keep the shortest version
+    """
+    sp = spotifaj_functions.get_spotify_client(username=username)
+    if not sp:
+        logger.error("Failed to initialize Spotify client.")
+        sys.exit(1)
+    
+    # Resolve source playlist ID
+    source_id = None
+    match = re.search(r'playlist/([a-zA-Z0-9]+)', source_playlist)
+    if match:
+        source_id = match.group(1)
+    elif re.match(r'^[a-zA-Z0-9]{22}$', source_playlist):
+        source_id = source_playlist
+    else:
+        # Try exact match first, then fuzzy match
+        source_id = spotifaj_functions.find_playlist_by_name_fuzzy(username, source_playlist)
+    
+    if not source_id:
+        console.print(f"[red]Could not find source playlist: {source_playlist}[/red]")
+        console.print(f"\n[yellow]Note:[/yellow] If this is a Spotify-curated playlist (Discover Weekly, etc.):")
+        console.print(f"[yellow]       These are [bold]completely inaccessible[/bold] without 'extended quota mode'.[/yellow]")
+        console.print(f"[dim]       See SPOTIFY_PLAYLIST_RESTRICTIONS.md for solutions.[/dim]")
+        # Show similar playlists
+        all_playlists = spotifaj_functions.fetch_all_user_playlists(username)
+        if all_playlists:
+            search_lower = source_playlist.lower()
+            similar = [p['name'] for p in all_playlists if search_lower in p['name'].lower()][:5]
+            if similar:
+                console.print(f"\n[yellow]Or did you mean one of these?[/yellow]")
+                for name in similar:
+                    console.print(f"  - {name}")
+        sys.exit(1)
+    
+    # Resolve target playlist ID
+    target_id = None
+    match = re.search(r'playlist/([a-zA-Z0-9]+)', target_playlist)
+    if match:
+        target_id = match.group(1)
+    elif re.match(r'^[a-zA-Z0-9]{22}$', target_playlist):
+        target_id = target_playlist
+    else:
+        # Try exact match first, then fuzzy match
+        target_id = spotifaj_functions.find_playlist_by_name_fuzzy(username, target_playlist)
+    
+    if not target_id:
+        console.print(f"[red]Could not find target playlist: {target_playlist}[/red]")
+        console.print(f"\n[yellow]Note:[/yellow] If this is a Spotify-curated playlist (Discover Weekly, etc.):")
+        console.print(f"[yellow]       These are [bold]completely inaccessible[/bold] without 'extended quota mode'.[/yellow]")
+        console.print(f"[dim]       See SPOTIFY_PLAYLIST_RESTRICTIONS.md for solutions.[/dim]")
+        # Show similar playlists
+        all_playlists = spotifaj_functions.fetch_all_user_playlists(username)
+        if all_playlists:
+            search_lower = target_playlist.lower()
+            similar = [p['name'] for p in all_playlists if search_lower in p['name'].lower()][:5]
+            if similar:
+                console.print(f"\n[yellow]Or did you mean one of these?[/yellow]")
+                for name in similar:
+                    console.print(f"  - {name}")
+        sys.exit(1)
+    
+    # Get playlist names for display
+    try:
+        source_info = sp.playlist(source_id)
+        target_info = sp.playlist(target_id)
+        source_name = source_info['name']
+        target_name = target_info['name']
+    except Exception as e:
+        logger.error(f"Error fetching playlist info: {e}")
+        if "404" in str(e) or "not found" in str(e).lower():
+            console.print("\n[red]Error:[/red] Spotify returned 404 (Not Found) for one of the playlists.")
+            console.print("\n[yellow]This usually means:[/yellow]")
+            console.print("  • The playlist is Spotify-curated (Discover Weekly, Release Radar, etc.)")
+            console.print("  • Your app lacks 'extended quota mode' to access it")
+            console.print("  • See [cyan]SPOTIFY_PLAYLIST_RESTRICTIONS.md[/cyan] for solutions")
+        sys.exit(1)
+    
+    console.print(f"\n[bold cyan]Merging playlists:[/bold cyan]")
+    console.print(f"  Source: [green]{source_name}[/green]")
+    console.print(f"  Target: [yellow]{target_name}[/yellow]")
+    if keep_best:
+        console.print(f"  Dedup Strategy: [magenta]{keep_best}[/magenta]")
+    console.print()
+    
+    # Perform merge with deduplication
+    result = spotifaj_functions.copy_missing_tracks_with_dedup(
+        username=username,
+        source_playlist_id=source_id,
+        target_playlist_id=target_id,
+        keep_best=keep_best,
+        dry_run=dry_run
+    )
+    
+    if 'error' in result:
+        logger.error(result['error'])
+        sys.exit(1)
+    
+    # Display summary
+    console.print(f"[bold]Summary:[/bold]")
+    console.print(f"  Source tracks: [cyan]{result['source_count']}[/cyan]")
+    console.print(f"  Target tracks (before): [cyan]{result['target_count_before']}[/cyan]")
+    console.print()
+    
+    to_add = result['to_add']
+    
+    if to_add:
+        console.print(f"[green]Tracks to add from source ({len(to_add)}):[/green]")
+        for track in result['to_add_tracks'][:10]:  # Show first 10
+            artists = ", ".join([a['name'] for a in track['artists']])
+            console.print(f"  + {artists} - {track['name']}")
+        if len(to_add) > 10:
+            console.print(f"  ... and {len(to_add) - 10} more")
+        console.print()
+    else:
+        console.print("[dim]No new tracks to add (all source tracks already in target)[/dim]")
+        console.print()
+    
+    if dry_run:
+        console.print("[yellow]Note: Deduplication scan will run after adding tracks (not shown in dry-run)[/yellow]")
+        console.print()
+        console.print(f"[bold]After merge:[/bold]")
+        console.print(f"  Target tracks (estimated): [cyan]{result['target_count_after']}[/cyan]")
+        console.print()
+        console.print("[bold yellow]Dry run complete. Use without --dry-run to apply changes.[/bold yellow]")
+        return
+    
+    if not to_add:
+        console.print("[bold green]✓ Target already contains all tracks from source![/bold green]")
+        console.print("[yellow]Checking for duplicates...[/yellow]")
+    
+    # Confirm and apply changes
+    if to_add:
+        action_desc = f"add {len(to_add)} tracks and deduplicate"
+        if not spotifaj_functions.confirm(f"\nProceed to {action_desc}?", default=True):
+            console.print("[yellow]Merge cancelled.[/yellow]")
+            return
+    
+    # Actually perform the merge
+    result = spotifaj_functions.copy_missing_tracks_with_dedup(
+        username=username,
+        source_playlist_id=source_id,
+        target_playlist_id=target_id,
+        keep_best=keep_best,
+        dry_run=False
+    )
+    
+    console.print(f"\n[bold green]✓ Successfully merged '{source_name}' into '{target_name}'![/bold green]")
+    
+    if to_add:
+        console.print(f"  Added: [green]{len(to_add)}[/green] tracks")
+    
+    if result['duplicates_removed'] > 0:
+        console.print(f"  Removed: [red]{result['duplicates_removed']}[/red] duplicates")
+    else:
+        console.print("  [dim]No duplicates found[/dim]")
+    
+    console.print(f"\n[bold]Final count:[/bold]")
+    console.print(f"  Target tracks: [cyan]{result['target_count_after']}[/cyan]")
 
 @spotifaj.command(hidden=True)
 @click.option('--version', help="Version number for the release (e.g. 1.0.0). Defaults to next patch version.")
